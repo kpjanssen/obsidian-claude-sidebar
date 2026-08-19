@@ -6780,6 +6780,26 @@ var CLI_BACKENDS = {
     resumeIsSubcommand: false,
   },
 };
+function findCliBinary(binary, pathStr, extraDirs) {
+  const dirs = [];
+  if (pathStr) dirs.push(...pathStr.split(path.delimiter));
+  for (const dir of extraDirs || []) {
+    if (dir && !dirs.includes(dir)) dirs.unshift(dir);
+  }
+  const names = process.platform === "win32"
+    ? [binary, `${binary}.exe`, `${binary}.cmd`, `${binary}.bat`]
+    : [binary];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const name of names) {
+      try {
+        const candidate = path.join(dir, name);
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+      } catch (_) {}
+    }
+  }
+  return null;
+}
 var TerminalView = class extends import_obsidian.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -7841,6 +7861,7 @@ var TerminalView = class extends import_obsidian.ItemView {
     const rows = this.term?.rows || 24;
     const isWindows = process.platform === "win32";
     const shell = this.plugin.resolveShell().binary;
+    const shellKind = this.plugin.resolveShell().kind;
     // PTY scripts embedded as base64 for Obsidian plugin directory compatibility
     // See terminal_pty.py and terminal_win.py for readable source. Rebuild with: ./build.sh
     const PTY_SCRIPT_B64 = "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJQVFkgd3JhcHBlciB3aXRoIHJlc2l6ZSBzdXBwb3J0IGZvciBPYnNpZGlhbiB0ZXJtaW5hbCBwbHVnaW4uIiIiCmltcG9ydCBvcwppbXBvcnQgc3lzCmltcG9ydCBwdHkKaW1wb3J0IHN0cnVjdAppbXBvcnQgZmNudGwKaW1wb3J0IHRlcm1pb3MKaW1wb3J0IHNlbGVjdAppbXBvcnQgc2lnbmFsCmltcG9ydCB0aW1lCgojIEdsb2JhbCB0byB0cmFjayBjaGlsZCBQSUQgKGFsc28gdGhlIHByb2Nlc3MgZ3JvdXAgSUQpIGZvciBzaWduYWwgaGFuZGxlcgpjaGlsZF9waWQgPSBOb25lCgpkZWYga2lsbF9wcm9jZXNzX2dyb3VwKHBnaWQsIHNpZyk6CiAgICAiIiJLaWxsIGFuIGVudGlyZSBwcm9jZXNzIGdyb3VwLiIiIgogICAgdHJ5OgogICAgICAgIG9zLmtpbGxwZyhwZ2lkLCBzaWcpCiAgICBleGNlcHQgKFByb2Nlc3NMb29rdXBFcnJvciwgUGVybWlzc2lvbkVycm9yLCBPU0Vycm9yKToKICAgICAgICBwYXNzCgpkZWYgY2xlYW51cF9jaGlsZChzaWdudW0sIGZyYW1lKToKICAgICIiIktpbGwgdGhlIGVudGlyZSBwcm9jZXNzIGdyb3VwIHdoZW4gd2UgcmVjZWl2ZSBhIHNpZ25hbC4iIiIKICAgIGdsb2JhbCBjaGlsZF9waWQKICAgIGlmIGNoaWxkX3BpZDoKICAgICAgICAjIEtpbGwgZW50aXJlIHByb2Nlc3MgZ3JvdXAgKGNoaWxkIGlzIGdyb3VwIGxlYWRlcikKICAgICAgICBraWxsX3Byb2Nlc3NfZ3JvdXAoY2hpbGRfcGlkLCBzaWduYWwuU0lHVEVSTSkKICAgICAgICAjIEdpdmUgcHJvY2Vzc2VzIGEgbW9tZW50IHRvIGV4aXQgZ3JhY2VmdWxseQogICAgICAgIGZvciBfIGluIHJhbmdlKDEwKToKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgcGlkLCBfID0gb3Mud2FpdHBpZCgtY2hpbGRfcGlkLCBvcy5XTk9IQU5HKQogICAgICAgICAgICAgICAgaWYgcGlkICE9IDA6CiAgICAgICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICAgICAgZXhjZXB0IENoaWxkUHJvY2Vzc0Vycm9yOgogICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICAgICAgdGltZS5zbGVlcCgwLjEpCiAgICAgICAgZWxzZToKICAgICAgICAgICAgIyBGb3JjZSBraWxsIHRoZSBlbnRpcmUgZ3JvdXAgaWYgc3RpbGwgcnVubmluZwogICAgICAgICAgICBraWxsX3Byb2Nlc3NfZ3JvdXAoY2hpbGRfcGlkLCBzaWduYWwuU0lHS0lMTCkKICAgIHN5cy5leGl0KDApCgpkZWYgc2V0X3NpemUoZmQsIGNvbHMsIHJvd3MpOgogICAgIiIiU2V0IHRoZSBQVFkgd2luZG93IHNpemUuIiIiCiAgICB3aW5zaXplID0gc3RydWN0LnBhY2soJ0hISEgnLCByb3dzLCBjb2xzLCAwLCAwKQogICAgZmNudGwuaW9jdGwoZmQsIHRlcm1pb3MuVElPQ1NXSU5TWiwgd2luc2l6ZSkKCmRlZiBtYWluKCk6CiAgICBnbG9iYWwgY2hpbGRfcGlkCgogICAgIyBQYXJzZSBhcmdzOiB0ZXJtaW5hbF9wdHkucHkgW2NvbHNdIFtyb3dzXSBbc2hlbGxdIFtzaGVsbF9hcmdzLi4uXQogICAgaWYgbGVuKHN5cy5hcmd2KSA8IDQ6CiAgICAgICAgcHJpbnQoZiJVc2FnZToge3N5cy5hcmd2WzBdfSBjb2xzIHJvd3Mgc2hlbGwgW2FyZ3MuLi5dIiwgZmlsZT1zeXMuc3RkZXJyKQogICAgICAgIHN5cy5leGl0KDEpCgogICAgY29scyA9IGludChzeXMuYXJndlsxXSkKICAgIHJvd3MgPSBpbnQoc3lzLmFyZ3ZbMl0pCiAgICBzaGVsbCA9IHN5cy5hcmd2WzNdCiAgICBzaGVsbF9hcmdzID0gc3lzLmFyZ3ZbMzpdICAjIEluY2x1ZGUgc2hlbGwgYXMgYXJndlswXQoKICAgICMgT24gTGludXgsIGFzayB0aGUga2VybmVsIHRvIHNlbmQgdXMgU0lHSFVQIGlmIG91ciBwYXJlbnQgZGllcy4KICAgICMgQ2F0Y2hlcyBwYXRocyB3aGVyZSB0aGUgcGx1Z2luJ3MgdGFiLWNsb3NlIGhhbmRsZXIgZG9lc24ndCBmaXJlCiAgICAjIGFuZCB3ZSdkIG90aGVyd2lzZSBiZSBvcnBoYW5lZCB0byBpbml0IGhvbGRpbmcgYSBsaXZlIFBUWSB0cmVlLgogICAgaWYgc3lzLnBsYXRmb3JtLnN0YXJ0c3dpdGgoJ2xpbnV4Jyk6CiAgICAgICAgdHJ5OgogICAgICAgICAgICBpbXBvcnQgY3R5cGVzCiAgICAgICAgICAgIFBSX1NFVF9QREVBVEhTSUcgPSAxCiAgICAgICAgICAgIGxpYmMgPSBjdHlwZXMuQ0RMTCgnbGliYy5zby42JywgdXNlX2Vycm5vPVRydWUpCiAgICAgICAgICAgIGxpYmMucHJjdGwoUFJfU0VUX1BERUFUSFNJRywgc2lnbmFsLlNJR0hVUCwgMCwgMCwgMCkKICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICBwYXNzCgogICAgIyBSZWdpc3RlciBzaWduYWwgaGFuZGxlcnMgZm9yIGNsZWFudXAgQkVGT1JFIGZvcmsgdG8gYXZvaWQgcmFjZSBjb25kaXRpb24KICAgIHNpZ25hbC5zaWduYWwoc2lnbmFsLlNJR1RFUk0sIGNsZWFudXBfY2hpbGQpCiAgICBzaWduYWwuc2lnbmFsKHNpZ25hbC5TSUdJTlQsIGNsZWFudXBfY2hpbGQpCiAgICBzaWduYWwuc2lnbmFsKHNpZ25hbC5TSUdIVVAsIGNsZWFudXBfY2hpbGQpCgogICAgcGlkLCBmZCA9IHB0eS5mb3JrKCkKICAgIGNoaWxkX3BpZCA9IHBpZCAgIyBTdG9yZSBmb3Igc2lnbmFsIGhhbmRsZXIKCiAgICBpZiBwaWQgPT0gMDoKICAgICAgICAjIENoaWxkIHByb2Nlc3MgLSBhbHJlYWR5IGluIGl0cyBvd24gcHJvY2VzcyBncm91cCB2aWEgcHR5LmZvcmsoKS9zZXRzaWQoKQogICAgICAgIG9zLmV4ZWN2cChzaGVsbCwgc2hlbGxfYXJncykKICAgICAgICBzeXMuZXhpdCgxKQoKICAgICMgUGFyZW50IHByb2Nlc3MKCiAgICAjIFNldCBpbml0aWFsIHNpemUKICAgIHNldF9zaXplKGZkLCBjb2xzLCByb3dzKQoKICAgIHN0ZGluX2ZkID0gc3lzLnN0ZGluLmZpbGVubygpCgogICAgIyBNYWtlIHN0ZGluIG5vbi1ibG9ja2luZwogICAgb2xkX2ZsYWdzID0gZmNudGwuZmNudGwoc3RkaW5fZmQsIGZjbnRsLkZfR0VURkwpCiAgICBmY250bC5mY250bChzdGRpbl9mZCwgZmNudGwuRl9TRVRGTCwgb2xkX2ZsYWdzIHwgb3MuT19OT05CTE9DSykKCiAgICBydW5uaW5nID0gVHJ1ZQogICAgdHJ5OgogICAgICAgIHdoaWxlIHJ1bm5pbmc6CiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIHJsaXN0LCBfLCBfID0gc2VsZWN0LnNlbGVjdChbZmQsIHN0ZGluX2ZkXSwgW10sIFtdLCAwLjA1KQogICAgICAgICAgICBleGNlcHQgc2VsZWN0LmVycm9yOgogICAgICAgICAgICAgICAgYnJlYWsKCiAgICAgICAgICAgIGZvciByZWFkeV9mZCBpbiBybGlzdDoKICAgICAgICAgICAgICAgIGlmIHJlYWR5X2ZkID09IGZkOgogICAgICAgICAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgICAgICAgICAgZGF0YSA9IG9zLnJlYWQoZmQsIDE2Mzg0KQogICAgICAgICAgICAgICAgICAgICAgICBpZiBub3QgZGF0YToKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHJ1bm5pbmcgPSBGYWxzZQogICAgICAgICAgICAgICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICAgICAgICAgICAgICAgICAgb3Mud3JpdGUoc3lzLnN0ZG91dC5maWxlbm8oKSwgZGF0YSkKICAgICAgICAgICAgICAgICAgICAgICAgc3lzLnN0ZG91dC5mbHVzaCgpCiAgICAgICAgICAgICAgICAgICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgICAgICAgICAgICAgICAgIHJ1bm5pbmcgPSBGYWxzZQogICAgICAgICAgICAgICAgICAgICAgICBicmVhawogICAgICAgICAgICAgICAgZWxpZiByZWFkeV9mZCA9PSBzdGRpbl9mZDoKICAgICAgICAgICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICAgICAgICAgIGRhdGEgPSBvcy5yZWFkKHN0ZGluX2ZkLCAxNjM4NCkKICAgICAgICAgICAgICAgICAgICAgICAgaWYgbm90IGRhdGE6CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAjIHN0ZGluIGNsb3NlZCAtIHBsdWdpbiB0ZXJtaW5hdGVkCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBydW5uaW5nID0gRmFsc2UKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGJyZWFrCiAgICAgICAgICAgICAgICAgICAgICAgIGlmIGRhdGE6CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAjIENoZWNrIGZvciByZXNpemUgZXNjYXBlIHNlcXVlbmNlIGFueXdoZXJlIGluIGRhdGE6IFx4MWJdUkVTSVpFO2NvbHM7cm93c1x4MDcKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHdoaWxlIGInXHgxYl1SRVNJWkU7JyBpbiBkYXRhOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHN0YXJ0ID0gZGF0YS5pbmRleChiJ1x4MWJdUkVTSVpFOycpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBlbmQgPSBkYXRhLmluZGV4KGInXHgwNycsIHN0YXJ0KQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICByZXNpemVfZGF0YSA9IGRhdGFbc3RhcnQrOTplbmRdLmRlY29kZSgpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGMsIHIgPSByZXNpemVfZGF0YS5zcGxpdCgnOycpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHNldF9zaXplKGZkLCBpbnQoYyksIGludChyKSkKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIyBSZW1vdmUgdGhlIHJlc2l6ZSBjb21tYW5kIGZyb20gZGF0YQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBkYXRhID0gZGF0YVs6c3RhcnRdICsgZGF0YVtlbmQrMTpdCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZXhjZXB0IChWYWx1ZUVycm9yLCBJbmRleEVycm9yKToKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGlmIGRhdGE6CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgb3Mud3JpdGUoZmQsIGRhdGEpCiAgICAgICAgICAgICAgICAgICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgICAgICAgICAgICAgICAgIHJ1bm5pbmcgPSBGYWxzZQogICAgICAgICAgICAgICAgICAgICAgICBicmVhawoKICAgICAgICAgICAgIyBDaGVjayBpZiBjaGlsZCBleGl0ZWQKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgd3BpZCwgc3RhdHVzID0gb3Mud2FpdHBpZChwaWQsIG9zLldOT0hBTkcpCiAgICAgICAgICAgICAgICBpZiB3cGlkID09IHBpZDoKICAgICAgICAgICAgICAgICAgICBzeXMuZXhpdChvcy53YWl0c3RhdHVzX3RvX2V4aXRjb2RlKHN0YXR1cykpCiAgICAgICAgICAgIGV4Y2VwdCBDaGlsZFByb2Nlc3NFcnJvcjoKICAgICAgICAgICAgICAgIGJyZWFrCiAgICBmaW5hbGx5OgogICAgICAgIGZjbnRsLmZjbnRsKHN0ZGluX2ZkLCBmY250bC5GX1NFVEZMLCBvbGRfZmxhZ3MpCiAgICAgICAgIyBFbnN1cmUgZW50aXJlIHByb2Nlc3MgZ3JvdXAgaXMgdGVybWluYXRlZCB3aGVuIHdlIGV4aXQKICAgICAgICBpZiBjaGlsZF9waWQ6CiAgICAgICAgICAgIGtpbGxfcHJvY2Vzc19ncm91cChjaGlsZF9waWQsIHNpZ25hbC5TSUdURVJNKQogICAgICAgICAgICBmb3IgXyBpbiByYW5nZSgxMCk6CiAgICAgICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICAgICAgd3BpZCwgXyA9IG9zLndhaXRwaWQoLWNoaWxkX3BpZCwgb3MuV05PSEFORykKICAgICAgICAgICAgICAgICAgICBpZiB3cGlkICE9IDA6CiAgICAgICAgICAgICAgICAgICAgICAgIGJyZWFrCiAgICAgICAgICAgICAgICBleGNlcHQgQ2hpbGRQcm9jZXNzRXJyb3I6CiAgICAgICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICAgICAgICAgIHRpbWUuc2xlZXAoMC4xKQogICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAga2lsbF9wcm9jZXNzX2dyb3VwKGNoaWxkX3BpZCwgc2lnbmFsLlNJR0tJTEwpCgppZiBfX25hbWVfXyA9PSAnX19tYWluX18nOgogICAgbWFpbigpCg==";
@@ -7900,15 +7921,11 @@ var TerminalView = class extends import_obsidian.ItemView {
         cliCmd += " " + backend.resumeFlag;
       }
     }
-    const shellCmd = continueSession
-      ? `${cliCmd} || ${baseCmd} || true; exec $SHELL -i`
-      : `${cliCmd} || true; exec $SHELL -i`;
-    let args = isWindows
-      ? [ptyPath, String(cols), String(rows), shell]
-      : [ptyPath, String(cols), String(rows), shell, "-lc", shellCmd];
 
     // Get PATH from user's login shell (GUI apps don't inherit shell config)
     let shellEnv = { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" };
+    const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+    const pathHints = (backend.pathHints || []).map(p => p.replace("~", homeDir));
     if (!isWindows) {
       try {
         const shellOutput = (0, import_child_process.execSync)(
@@ -7925,8 +7942,6 @@ var TerminalView = class extends import_obsidian.ItemView {
         console.warn('[Claude Sidebar] PATH detection timed out — falling back to system PATH. If tools are missing, check your shell startup time.');
       }
       // Ensure backend-specific paths are available
-      const homeDir = process.env.HOME || '';
-      const pathHints = (backend.pathHints || []).map(p => p.replace('~', homeDir));
       for (const hint of pathHints) {
         if (hint && shellEnv.PATH && !shellEnv.PATH.includes(hint)) {
           shellEnv.PATH = `${hint}:${shellEnv.PATH}`;
@@ -7946,6 +7961,24 @@ var TerminalView = class extends import_obsidian.ItemView {
       const val = trimmed.slice(eq + 1).trim();
       if (key) shellEnv[key] = val;
     }
+
+    // WSL's PATH is inside the distro. A Windows filesystem probe would skip
+    // launch for a CLI that is installed in Linux.
+    const cliFound = shellKind === "wsl" || !!findCliBinary(backend.binary, shellEnv.PATH, pathHints);
+    if (!cliFound) {
+      this.term?.writeln("");
+      this.term?.writeln(`${backend.label} isn't installed or isn't on PATH.`);
+      this.term?.writeln(`Install ${backend.label}, then fully quit and reopen Obsidian.`);
+      this.term?.writeln("");
+    }
+    const shellCmd = !cliFound
+      ? `exec $SHELL -i`
+      : continueSession
+        ? `${cliCmd} || ${baseCmd} || true; exec $SHELL -i`
+        : `${cliCmd} || true; exec $SHELL -i`;
+    let args = isWindows
+      ? [ptyPath, String(cols), String(rows), shell]
+      : [ptyPath, String(cols), String(rows), shell, "-lc", shellCmd];
 
     this.proc = (0, import_child_process.spawn)(cmd, args, {
       cwd,
@@ -8022,7 +8055,7 @@ var TerminalView = class extends import_obsidian.ItemView {
     }, 500);
     this.term?.focus();
     // Windows still needs auto-launch since we can't use exec there
-    if (isWindows) {
+    if (isWindows && cliFound) {
       setTimeout(() => {
         if (this.proc && !this.proc.killed) {
           let winCmd = backend.binary;
