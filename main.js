@@ -6893,6 +6893,10 @@ var TerminalView = class extends import_obsidian.ItemView {
       this.app.workspace.onLayoutReady(() => {
         setTimeout(() => {
           try {
+            // The leaf can be closed inside the defer window. dispose() already
+            // ran, so re-entering onOpen() would flip _isDisposed back to false
+            // and start a shell on a detached view — an orphan PTY nothing reaps.
+            if (this._isDisposed) return;
             this.onOpen();
           } catch (err) {
             console.error("[Claude Sidebar] Deferred terminal init failed:", err);
