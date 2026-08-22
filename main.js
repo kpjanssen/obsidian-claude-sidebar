@@ -6739,12 +6739,12 @@ var CLI_BACKENDS = {
     resumeFlag: "--continue",
     resumeIsSubcommand: false,
   },
-  gemini: {
-    label: "Gemini CLI",
-    binary: "gemini",
-    pathHints: [],
-    yoloFlag: "--approval-mode=yolo",
-    resumeFlag: "--resume",
+  antigravity: {
+    label: "Antigravity CLI",
+    binary: "agy",
+    pathHints: ["~/.local/bin"],
+    yoloFlag: "--dangerously-skip-permissions",
+    resumeFlag: "--continue",
     resumeIsSubcommand: false,
   },
   kimi: {
@@ -6779,6 +6779,11 @@ var CLI_BACKENDS = {
     resumeFlag: "--continue",
     resumeIsSubcommand: false,
   },
+};
+// Providers that were replaced by a successor CLI. A saved selection is remapped
+// on load so it doesn't silently fall back to Claude Code via getBackendKey().
+var RENAMED_BACKENDS = {
+  gemini: "antigravity",
 };
 function findCliBinary(binary, pathStr, extraDirs) {
   const dirs = [];
@@ -6865,8 +6870,9 @@ var TerminalView = class extends import_obsidian.ItemView {
     if (state?.continueSession) {
       this.continueSession = state.continueSession;
     }
-    if (state?.backendKey && CLI_BACKENDS[state.backendKey]) {
-      this.backendKey = state.backendKey;
+    if (state?.backendKey) {
+      const key = RENAMED_BACKENDS[state.backendKey] || state.backendKey;
+      if (CLI_BACKENDS[key]) this.backendKey = key;
     }
     // If shell already started, restart with new settings
     if (this.proc && (state?.workingDir || state?.yoloMode || state?.continueSession || state?.backendKey)) {
@@ -8354,6 +8360,11 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
       const key = this.pluginData.cliBackend || "claude";
       this.pluginData.flagsByProvider = { [key]: this.pluginData.additionalFlags };
       delete this.pluginData.additionalFlags;
+      await this.saveData(this.pluginData);
+    }
+    const renamedBackend = RENAMED_BACKENDS[this.pluginData.cliBackend];
+    if (renamedBackend) {
+      this.pluginData.cliBackend = renamedBackend;
       await this.saveData(this.pluginData);
     }
     this.lastActiveTerminalLeaf = null;
