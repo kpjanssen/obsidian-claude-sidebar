@@ -7936,6 +7936,15 @@ var TerminalView = class extends import_obsidian.ItemView {
     let shellEnv = { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" };
     const homeDir = process.env.HOME || process.env.USERPROFILE || "";
     const pathHints = (backend.pathHints || []).map(p => p.replace("~", homeDir));
+    if (isWindows) {
+      // process.env is case-insensitive on Windows, but the spread copy is not —
+      // Windows spells it "Path", so shellEnv.PATH was silently undefined.
+      const pathKey = Object.keys(shellEnv).find(k => k.toUpperCase() === "PATH");
+      if (pathKey && pathKey !== "PATH") {
+        shellEnv.PATH = shellEnv[pathKey];
+        delete shellEnv[pathKey];
+      }
+    }
     if (!isWindows) {
       try {
         const shellOutput = (0, import_child_process.execSync)(
@@ -7951,11 +7960,22 @@ var TerminalView = class extends import_obsidian.ItemView {
         // Fall back to process.env.PATH if shell init fails
         console.warn('[Claude Sidebar] PATH detection timed out — falling back to system PATH. If tools are missing, check your shell startup time.');
       }
-      // Ensure backend-specific paths are available
-      for (const hint of pathHints) {
-        if (hint && shellEnv.PATH && !shellEnv.PATH.includes(hint)) {
-          shellEnv.PATH = `${hint}:${shellEnv.PATH}`;
-        }
+    } else {
+      try {
+        const psOut = (0, import_child_process.execSync)(
+          `powershell.exe -NoProfile -NonInteractive -Command "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"`,
+          { encoding: "utf8", timeout: 5000, windowsHide: true }
+        );
+        const freshPath = psOut.trim();
+        if (freshPath) shellEnv.PATH = freshPath;
+      } catch (e) {
+        console.warn("[Claude Sidebar] Windows PATH refresh failed — falling back to process PATH.");
+      }
+    }
+    // Ensure backend-specific paths are available
+    for (const hint of pathHints) {
+      if (hint && shellEnv.PATH && !shellEnv.PATH.includes(hint)) {
+        shellEnv.PATH = `${hint}${path.delimiter}${shellEnv.PATH}`;
       }
     }
 
