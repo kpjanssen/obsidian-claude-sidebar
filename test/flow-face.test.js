@@ -26,7 +26,9 @@ function loadRegion() {
   }
   return new Function(
     source.slice(from, to) +
-      "\nreturn { flowSessionNode, flowRootNode, flowAnchor, flowSummarise, flowFace," + " flowTooltip, flowValidateDocument, FLOW_SUPPORTED_KINDS };"
+      "\nreturn { flowSessionNode, flowRootNode, flowAnchor, flowSummarise, flowFace, flowSubFace," +
+      " flowTooltip, flowNodeClass, flowIsTrigger, flowTriggerState, flowValidateDocument," +
+      " FLOW_SUPPORTED_KINDS, FLOW_TRIGGER_KINDS };"
   )();
 }
 
@@ -231,6 +233,160 @@ equal(
     seen += 1;
   }
   console.log("checked " + seen + " plan(s) from " + dir);
+})();
+
+// Enablement and liveness are two fields, and every one of these checks exists
+// because collapsing them into one would still pass a test that only looked at
+// whether *something* was drawn.
+(function aTriggerStatesBothFields() {
+  const armed = { kind: "scheduled_task", enabled: true, liveness: "observed", scope: "in_scope" };
+  equal(F.flowTriggerState(armed), "enabled \u00b7 observed", "an armed, seen trigger states both");
+  equal(F.flowSubFace(armed), "enabled \u00b7 observed", "and that is its second line");
+
+  const off = { kind: "scheduled_task", enabled: false, liveness: "observed" };
+  equal(F.flowTriggerState(off), "disabled", "a disabled trigger says so");
+
+  const blind = { kind: "git_hook", enabled: true, liveness: "unavailable" };
+  equal(
+    F.flowTriggerState(blind),
+    "enabled \u00b7 liveness unavailable",
+    "a trigger nothing can observe is not reported as never having fired"
+  );
+
+  const cold = { kind: "claude_hook", enabled: true, liveness: "never_observed" };
+  equal(
+    F.flowTriggerState(cold),
+    "enabled \u00b7 never observed",
+    "armed but never seen is its own state, not 'unavailable'"
+  );
+
+  const outside = { kind: "scheduled_task", enabled: true, scope: "out_of_scope", liveness: "observed" };
+  equal(F.flowTriggerState(outside), "out of scope", "scope is read before either field");
+
+  const silent = { kind: "scheduled_task", enabled: true };
+  equal(
+    F.flowTriggerState(silent),
+    "enabled \u00b7 liveness unrecorded",
+    "an absent liveness is stated as absent, never defaulted to observed"
+  );
+  equal(
+    F.flowTriggerState({ kind: "git_hook" }),
+    "enablement unrecorded",
+    "an absent enablement is likewise stated rather than assumed true"
+  );
+})();
+
+(function everyStateFitsTheClip() {
+  // The node's second line is clipped at 30 characters, and the tail of a
+  // trigger's state is its liveness -- the field this document exists for.
+  const states = [
+    { kind: "scheduled_task", enabled: true, liveness: "observed" },
+    { kind: "scheduled_task", enabled: true, liveness: "never_observed" },
+    { kind: "scheduled_task", enabled: true, liveness: "unavailable" },
+    { kind: "scheduled_task", enabled: true },
+    { kind: "scheduled_task", enabled: false },
+    { kind: "scheduled_task", scope: "out_of_scope" }
+  ];
+  for (const state of states) {
+    const text = F.flowSubFace(state);
+    check(text.length <= 30, "the state '" + text + "' survives the 30-character clip");
+  }
+})();
+
+(function aTriggerIsClassedByMechanismAndState() {
+  equal(
+    F.flowNodeClass({ kind: "claude_hook", enabled: true, liveness: "observed" }),
+    "flow-node-trigger flow-node-claude-hook",
+    "an armed, observed trigger carries no state modifier"
+  );
+  check(
+    F.flowNodeClass({ kind: "git_hook", enabled: false }).indexOf("is-disabled") !== -1,
+    "a disabled trigger is marked in the drawing, not only in its text"
+  );
+  check(
+    F.flowNodeClass({ kind: "scheduled_task", enabled: true, scope: "out_of_scope" }).indexOf("is-out-of-scope") !== -1,
+    "so is one out of scope"
+  );
+  equal(
+    F.flowNodeClass({ kind: "dispatch", outcome: "ok" }),
+    "flow-node-dispatch",
+    "and a dispatch is untouched by any of it"
+  );
+  check(!F.flowIsTrigger({ kind: "dispatch" }), "a dispatch is not a trigger");
+  check(!F.flowIsTrigger({ kind: "webhook" }), "an unseen kind is not assumed to be a trigger");
+  equal(F.FLOW_TRIGGER_KINDS.length, 3, "three mechanisms, as a closed list");
+})();
+
+(function anInventoryIsNamedByItsMachine() {
+  const document = {
+    schema_version: 2,
+    kind: "trigger-inventory",
+    host: "A-MACHINE",
+    counts: { nodes: 3 },
+    nodes: [
+      { "graph.node.id": "trigger:scheduled_task:0", "graph.node.name": "some task", kind: "scheduled_task" },
+      { "graph.node.id": "trigger:scheduled_task:1", "graph.node.name": "another", kind: "scheduled_task" },
+      { "graph.node.id": "trigger:git_hook:0", "graph.node.name": "a hook", kind: "git_hook" }
+    ]
+  };
+  const summary = F.flowSummarise(
+    { file: "x", project: "_flow", sessionId: "trigger-inventory", documentClass: "trigger-inventory" },
+    document
+  );
+  equal(
+    summary.title,
+    "triggers on A-MACHINE",
+    "an inventory is named by the machine, never by whichever trigger happens to be first"
+  );
+  equal(summary.documentClass, "trigger-inventory", "and it is classed as one");
+  equal(summary.nodes, 3, "its measure is the mechanism count");
+  equal(F.flowValidateDocument(document).ok, true, "the pane accepts it");
+
+  const hostless = Object.assign({}, document);
+  delete hostless.host;
+  equal(
+    F.flowSummarise({ file: "x", sessionId: "i", documentClass: "trigger-inventory" }, hostless).title,
+    "triggers on an unrecorded host",
+    "and an unrecorded host is stated, not filled in"
+  );
+})();
+
+(function theHoverTextNamesTheMechanism() {
+  const node = {
+    kind: "scheduled_task",
+    "graph.node.name": "OneDrive Reporting Task",
+    enabled: true,
+    liveness: "observed",
+    triggers: "daily at 09:00",
+    command: "C:/x/y.exe"
+  };
+  const tip = F.flowTooltip(node);
+  check(tip.indexOf("mechanism: scheduled task") !== -1, "the hover text says what kind of trigger it is");
+  check(tip.indexOf("fires: daily at 09:00") !== -1, "and when it fires");
+  check(tip.indexOf("runs: C:/x/y.exe") !== -1, "and what it runs");
+})();
+
+// The inventory actually on disk, when the store is reachable.
+(function theRealInventory() {
+  const store = process.env.FLOW_STORE;
+  if (!store || !fs.existsSync(store)) return;
+  let seen = 0;
+  for (const file of fs.readdirSync(store)) {
+    if (!file.endsWith(".triggers.json")) continue;
+    const document = JSON.parse(fs.readFileSync(path.join(store, file), "utf8"));
+    equal(F.flowValidateDocument(document).ok, true, "real inventory " + file + " is accepted");
+    for (const node of document.nodes || []) {
+      check(F.flowIsTrigger(node), file + ": " + node["graph.node.id"] + " is a known mechanism");
+      const state = F.flowTriggerState(node);
+      check(state.length <= 30, file + ": '" + state + "' survives the clip");
+      check(
+        state !== "enablement unrecorded" && state !== "enabled \u00b7 liveness unrecorded",
+        file + ": " + node["graph.node.id"] + " records both enablement and liveness"
+      );
+    }
+    seen += 1;
+  }
+  console.log("checked " + seen + " trigger inventory/inventories from " + store);
 })();
 
 console.log((checks - failures) + "/" + checks + " face checks passed");

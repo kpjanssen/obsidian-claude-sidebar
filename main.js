@@ -9024,6 +9024,13 @@ var FLOW_GRAPH_SUFFIX = ".graph.json";
 var FLOW_PLAN_SUFFIX = ".plan.json";
 var FLOW_PLAN_DIRNAME = ".claude/flow-plans";
 
+// The third document. A trigger inventory is what this machine is set to fire
+// without being asked -- scheduled tasks, Claude hooks, git hooks. It sits at
+// the top level of the reserved directory rather than under a project slug,
+// because it is a fact about the machine and not about any one project, and
+// there is one of them.
+var FLOW_TRIGGER_SUFFIX = ".triggers.json";
+
 // Layout constants. Deliberately the same shape as the canvas writer's
 // (`flow/canvas_core.py`), scaled down for a docked pane: the two renderers
 // consume one contract and a reader moving between them should not have to
@@ -9042,6 +9049,11 @@ var FLOW_ROW = FLOW_NODE_H + FLOW_ROW_GAP;
 // times taller than wide, which is the strip-shaped drawing `canvas_core`'s
 // own MAX_ROWS comment records as unreadable at fit-zoom.
 var FLOW_MAX_ROWS = 12;
+
+// Headroom above a grouped drawing, for the heading that names each group.
+// Only the flat branch reserves it; a run graph draws no headings and so is
+// laid out exactly as it was before.
+var FLOW_GROUP_HEAD = 26;
 
 // Turns stack downwards to this height, then the next group of turns packs to
 // the right instead. Same reasoning and same purpose as canvas_core's
@@ -9134,6 +9146,27 @@ function flowListDocumentFiles(root) {
     return { found, error: err };
   }
   for (const entry of projects) {
+    // The trigger inventory is a sibling of the project directories, not a
+    // member of one, so it is picked up in this pass rather than by a second
+    // scan of the same directory.
+    if (entry.isFile() && entry.name.endsWith(FLOW_TRIGGER_SUFFIX)) {
+      const inventory = path.join(root, entry.name);
+      let stat = null;
+      try {
+        stat = fs.statSync(inventory);
+      } catch (err) {
+        continue;
+      }
+      found.push({
+        file: inventory,
+        documentClass: "trigger-inventory",
+        project: FLOW_RESERVED_DIRNAME,
+        sessionId: entry.name.slice(0, -FLOW_TRIGGER_SUFFIX.length),
+        mtimeMs: stat.mtimeMs,
+        size: stat.size
+      });
+      continue;
+    }
     if (!entry.isDirectory()) continue;
     const dir = path.join(root, entry.name);
     let files;
@@ -9210,6 +9243,7 @@ function flowSummarise(entry, document) {
   const counts = (document && document.counts) || {};
   const session = flowSessionNode(document);
   const root = session || flowRootNode(document);
+  const inventory = !!document && flowDocumentKind(document) === "trigger-inventory";
   return {
     file: entry.file,
     project: entry.project,
@@ -9224,7 +9258,15 @@ function flowSummarise(entry, document) {
     modelInheriting: counts.model_inheriting || 0,
     // Null, never a fallback to the id: a caller that wants the id can read
     // sessionId, and a title that is silently an id is the defect this fixes.
-    title: root ? root["graph.node.name"] || null : null,
+    // A trigger inventory is the one document with no root at all -- every
+    // node in it is a top-level fact, so the first one is not a name for the
+    // document. It is named by the machine it measured, which is the only
+    // thing that tells two of them apart.
+    title: inventory
+      ? "triggers on " + (document.host || "an unrecorded host")
+      : root
+        ? root["graph.node.name"] || null
+        : null,
     titleSource: session ? session.title_source || null : null,
     // What the session was asked for, which its title does not say. Null on a
     // plan, which has been asked nothing yet, and null on a session whose
@@ -9346,7 +9388,37 @@ function flowLayout(document) {
     return { bottom, width: width + nested };
   }
 
-  if (root) {
+  // A document where nothing records a parent is not a tree, and walking one
+  // would place the first node and drop every other one into the orphan
+  // column. A trigger inventory is exactly that document: each trigger is a
+  // top-level fact about the machine, related to nothing else drawn here. It
+  // is grouped by kind and wrapped past FLOW_MAX_ROWS with one blank column
+  // between groups -- the arrangement _group_layout() writes to the canvas
+  // file, so a reader moving between the pane and the canvas does not have to
+  // relearn where things are. The test is structural rather than a kind list,
+  // so a later document of flat facts needs no third branch.
+  const flat = nodes.length > 1 && nodes.every((n) => !n["graph.node.parent_id"]);
+  const groups = [];
+  if (flat) {
+    const kinds = [];
+    for (const node of nodes) {
+      const kind = node.kind || "";
+      if (kinds.indexOf(kind) === -1) kinds.push(kind);
+    }
+    let group = 0;
+    for (const kind of kinds) {
+      const members = nodes.filter((n) => (n.kind || "") === kind);
+      for (let index = 0; index < members.length; index++) {
+        put(
+          members[index],
+          group + Math.floor(index / FLOW_MAX_ROWS),
+          FLOW_GROUP_HEAD + (index % FLOW_MAX_ROWS) * FLOW_ROW
+        );
+      }
+      groups.push({ kind, count: members.length, x: group * FLOW_COLUMN, y: 0 });
+      group += Math.ceil(members.length / FLOW_MAX_ROWS) + 1;
+    }
+  } else if (root) {
     const topLevel = children.get(root["graph.node.id"]) || [];
     let base = 1;
     let run = 0;
@@ -9390,10 +9462,18 @@ function flowLayout(document) {
   if (!positions.size) {
     minX = 0; minY = 0; maxX = FLOW_NODE_W; maxY = FLOW_NODE_H;
   }
+  // The headings sit above the first row, so the reserved band must survive
+  // normalisation -- shifting it away would put them at a negative y, outside
+  // the drawing, which is the same as not drawing them.
+  if (groups.length) minY = 0;
   for (const [id, point] of positions) {
     positions.set(id, { x: point.x - minX, y: point.y - minY });
   }
-  return { positions, width: maxX - minX, height: maxY - minY };
+  for (const group of groups) {
+    group.x -= minX;
+    group.y -= minY;
+  }
+  return { positions, groups, width: maxX - minX, height: maxY - minY };
 }
 
 function flowSvg(tag, attrs) {
@@ -9411,6 +9491,33 @@ function flowClip(text, limit) {
   return flat.slice(0, Math.max(0, limit - 1)) + "…";
 }
 
+// The three mechanisms a trigger inventory records, as a closed list rather
+// than a `kind.endsWith("_hook")` test: a kind this build has never seen is
+// drawn as an unknown, not silently treated as a trigger.
+var FLOW_TRIGGER_KINDS = ["scheduled_task", "claude_hook", "git_hook"];
+
+function flowIsTrigger(node) {
+  return FLOW_TRIGGER_KINDS.indexOf(node.kind || "") !== -1;
+}
+
+// Enablement and liveness are two separate facts, and the drawing states both.
+// A trigger switched off and a trigger armed but never seen to fire are
+// different problems, and collapsing them into one word would hide the exact
+// difference the inventory exists to state. Mirrors _state_marker() in
+// flow/trigger_canvas.py with one deliberate divergence: where the canvas
+// writes a bare "enabled" for the observed case, the pane writes both fields
+// every time, because a reader scanning for liveness should not have to infer
+// it from a word not being there.
+function flowTriggerState(node) {
+  if (node.scope === "out_of_scope") return "out of scope";
+  if (node.enabled === false) return "disabled";
+  if (node.enabled !== true) return "enablement unrecorded";
+  if (node.liveness === "observed") return "enabled · observed";
+  if (node.liveness === "never_observed") return "enabled · never observed";
+  if (node.liveness === "unavailable") return "enabled · liveness unavailable";
+  return "enabled · liveness unrecorded";
+}
+
 function flowFace(node) {
   return node.summary || node["graph.node.name"] || node["graph.node.id"] || "?";
 }
@@ -9419,6 +9526,16 @@ function flowFace(node) {
 // Every part is a stated field; nothing is filled in when the document is
 // silent.
 function flowSubFace(node) {
+  // A trigger has no outcome and no model: it is a mechanism that is armed or
+  // is not, so its second line carries its state instead.
+  if (flowIsTrigger(node)) {
+    // The state alone, not the kind: the second line is clipped at 30
+    // characters, and "scheduled task · enabled · liveness unavailable" loses
+    // its tail there -- which would cut off the liveness field this whole
+    // document exists to state. The kind is carried by the group heading the
+    // node sits under, by its colour, and in words by the hover text.
+    return flowTriggerState(node);
+  }
   const parts = [String(node.kind || "?").replace(/_/g, " ")];
   if (node.outcome) parts.push(node.outcome);
   if (node.model) parts.push(node.model);
@@ -9432,6 +9549,12 @@ function flowSubFace(node) {
 function flowTooltip(node) {
   const lines = [flowFace(node), flowSubFace(node)];
   if (node.kind === "session" && node.first_prompt) lines.push("asked: " + node.first_prompt);
+  if (flowIsTrigger(node)) {
+    lines.push("mechanism: " + String(node.kind).replace(/_/g, " "));
+    if (node.triggers) lines.push("fires: " + node.triggers);
+    const runs = node.command || node.script_path;
+    if (runs) lines.push("runs: " + runs);
+  }
   return lines.join("\n");
 }
 
@@ -9440,6 +9563,17 @@ function flowNodeClass(node) {
   if (kind === "session") return "flow-node-session";
   if (kind === "orchestrator" || kind === "join") return "flow-node-structure";
   if (kind === "workflow_run" || kind === "workflow_agent") return "flow-node-workflow";
+  // Three classes, not one: the mechanism colours the box, and the state is a
+  // modifier on top of it, so enablement and liveness stay legible as separate
+  // marks in the drawing as well as in the text.
+  if (flowIsTrigger(node)) {
+    const marks = ["flow-node-trigger", "flow-node-" + kind.replace(/_/g, "-")];
+    if (node.scope === "out_of_scope") marks.push("is-out-of-scope");
+    else if (node.enabled === false) marks.push("is-disabled");
+    else if (node.liveness === "never_observed") marks.push("is-never-observed");
+    else if (node.liveness === "unavailable") marks.push("is-liveness-unavailable");
+    return marks.join(" ");
+  }
   if (node.outcome === "errored") return "flow-node-errored";
   return "flow-node-dispatch";
 }
@@ -9723,6 +9857,7 @@ var FlowGraphPane = class {
     // the forward half of this feature has to avoid.
     const groups = [
       ["workflows you can run", "plan"],
+      ["triggers on this machine", "trigger-inventory"],
       ["runs that already happened", "run"]
     ];
     const present = groups.filter(
@@ -9734,11 +9869,17 @@ var FlowGraphPane = class {
       for (const summary of this.summaries) {
         if ((summary.documentClass || "run") !== cls) continue;
         const option = holder.createEl("option", { value: summary.file });
+        // What a document counts is not the same thing from one kind to the
+        // next: a run counts dispatches, a plan counts the steps it defines,
+        // and an inventory counts mechanisms, none of which have run.
+        const measure =
+          cls === "trigger-inventory"
+            ? summary.nodes + " triggers"
+            : summary.dispatches + (cls === "plan" ? " steps" : " dispatches");
         option.textContent =
           (summary.title || summary.sessionId.slice(0, 8)) +
           " · " +
-          summary.dispatches +
-          (cls === "plan" ? " steps" : " dispatches") +
+          measure +
           (summary.widestFanout ? " · fan-out " + summary.widestFanout : "") +
           (summary.unreadable ? " · unreadable" : "") +
           (summary.refused ? " · refused" : "");
@@ -9766,11 +9907,50 @@ var FlowGraphPane = class {
     if (!doc) return;
     if (flowDocumentKind(doc) === "plan") {
       status.createSpan({
-        cls: "flow-status-plan",
+        cls: "flow-status-kind",
         text: "PLAN \u2014 work that could run, not a record of work that did"
       });
     }
     const counts = doc.counts || {};
+    // An inventory counts nothing a run graph counts -- no dispatches, no
+    // turns, no fan-out -- so it gets its own fact list rather than a shared
+    // one reading zero four times. Enablement and liveness are counted
+    // separately here for the same reason they are drawn separately.
+    if (flowDocumentKind(doc) === "trigger-inventory") {
+      status.createSpan({
+        cls: "flow-status-kind",
+        text: "TRIGGERS \u2014 what this machine is set to fire without being asked"
+      });
+      const armed = [
+        "host " + (doc.host || "unrecorded"),
+        (counts.nodes || 0) + " mechanisms",
+        (counts.enabled || 0) + " enabled",
+        (counts.disabled || 0) + " disabled"
+      ];
+      if (counts.liveness_unavailable) {
+        armed.push(counts.liveness_unavailable + " with liveness unavailable");
+      }
+      if (counts.out_of_scope) armed.push(counts.out_of_scope + " out of scope");
+      status.createSpan({ cls: "flow-status-facts", text: armed.join(" · ") });
+      // Two gaps the inventory states about itself. Both are silent when
+      // empty and neither is inferred: an unread mechanism is one the scan
+      // could not read, not one it decided was absent.
+      const unread = (doc.unread || []).length;
+      const orphaned = (doc.orphaned_toggles || []).length;
+      if (unread) {
+        status.createSpan({
+          cls: "flow-status-problem",
+          text: unread + " mechanism(s) could not be read, so this inventory is incomplete."
+        });
+      }
+      if (orphaned) {
+        status.createSpan({
+          cls: "flow-status-problem",
+          text: orphaned + " toggle(s) point at no mechanism this scan found."
+        });
+      }
+      return;
+    }
     const facts = [
       "schema " + (doc.schema_version === undefined ? "unrecorded" : doc.schema_version),
       "kind " + (doc.kind || "unrecorded"),
@@ -9862,6 +10042,20 @@ var FlowGraphPane = class {
     const nodeLayer = flowSvg("g", { class: "flow-nodes" });
     scene.appendChild(edgeLayer);
     scene.appendChild(nodeLayer);
+
+    // A grouped drawing names its groups. Colour alone would leave a reader
+    // to work out which mechanism a column is from a legend that does not
+    // exist, and the canvas writer labels the same groups.
+    for (const group of laid.groups || []) {
+      const heading = flowSvg("text", {
+        class: "flow-group-label",
+        x: group.x,
+        y: group.y + 16
+      });
+      heading.textContent =
+        String(group.kind || "?").replace(/_/g, " ") + " (" + group.count + ")";
+      scene.appendChild(heading);
+    }
 
     for (const edge of doc.edges || []) {
       const from = laid.positions.get(edge.source);
@@ -10098,7 +10292,10 @@ var FlowGraphPane = class {
     if (node.error) row("error", node.error);
     // These three are stated when present and stated as unrecorded when not,
     // because their absence is itself the finding this project measures.
-    row("description", node.summary || "not recorded");
+    // A trigger has no description to be missing: the field does not apply to
+    // a mechanism, and stating it as unrecorded would report an absence that
+    // is not a finding.
+    if (!flowIsTrigger(node)) row("description", node.summary || "not recorded");
     if (node.summary_source) row("description from", node.summary_source);
     if (node.kind === "session") {
       // A session's name comes from a record that may not exist, so the pane
@@ -10115,6 +10312,29 @@ var FlowGraphPane = class {
       if (node.model_inheriting !== undefined) {
         row("model inheriting", node.model_inheriting ? "yes — it ran on the session model" : "no");
       }
+    }
+    if (flowIsTrigger(node)) {
+      // The two fields this document exists to state, always both and always
+      // apart. `liveness from` says how liveness was decided, because
+      // "unavailable" is a statement about the mechanism -- a git hook leaves
+      // no run record anywhere -- and not about this trigger.
+      row("enabled", node.enabled === undefined ? "not recorded" : node.enabled ? "yes" : "no");
+      row("liveness", node.liveness || "not recorded");
+      row("liveness from", node.liveness_basis || "not recorded");
+      row("scope", node.scope);
+      row("fires on", node.triggers);
+      row("next run", node.next_run);
+      row("last fired", node.last_fired_raw);
+      row("last result", node.last_result);
+      row("event", node.event);
+      row("command", node.command);
+      row("declared in", node.source_path || node.hooks_path);
+      row("declared by", node.source);
+      row("script", node.script_path);
+      row("repository", node.repository);
+      row("task name", node.task_name);
+      row("author", node.author);
+      row("comment", node.comment);
     }
     row("started", flowStamp(node.timestamp));
     row("ended", node.ended_at ? flowStamp(node.ended_at) : null);
@@ -10237,6 +10457,25 @@ var FlowGraphPane = class {
       }
       return;
     }
+    // An inventory's canvas is under the reserved directory and therefore
+    // indexed, so it opens; the file that declares a trigger is a scheduler
+    // entry or a settings file outside the vault, so it is stated and copied.
+    if (flowDocumentKind(doc) === "trigger-inventory") {
+      const base = path.basename(this.selectedFile || "", FLOW_TRIGGER_SUFFIX);
+      const section = pane.createDiv({ cls: "flow-detail-section" });
+      section.createEl("h4", { text: "open" });
+      const actions = section.createDiv({ cls: "flow-detail-actions" });
+      this.addOpenButton(actions, "canvas", FLOW_RESERVED_DIRNAME + "/" + base + ".canvas", null);
+      const declared = node.source_path || node.hooks_path || node.script_path;
+      if (declared) {
+        section.createDiv({
+          cls: "flow-detail-note",
+          text: "declared in: " + declared + " — outside the vault, so Obsidian cannot open it."
+        });
+        this.addCopyButton(section, "copy declaring path", declared);
+      }
+      return;
+    }
     if (!doc.project || !doc.session_id) return;
     const stem = FLOW_RESERVED_DIRNAME + "/" + doc.project + "/" + doc.session_id;
     const section = pane.createDiv({ cls: "flow-detail-section" });
@@ -10304,7 +10543,11 @@ var FlowGraphPane = class {
         "from a run that already happened",
         "python -m flow plan --new NAME --from-run --session " + example
       ],
-      ["check every plan for a step that names no model", "python -m flow plan"]
+      ["check every plan for a step that names no model", "python -m flow plan"],
+      [
+        "read what this machine already fires on its own",
+        "python -m flow triggers --vault " + (this.app.vault.adapter.basePath || "PATH-TO-THIS-VAULT")
+      ]
     ];
     for (const [label, command] of recipes) {
       const box = pane.createDiv({ cls: "flow-detail-section" });

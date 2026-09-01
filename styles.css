@@ -503,7 +503,7 @@
 	stroke-dasharray: 4 3;
 }
 
-.flow-status-plan {
+.flow-status-kind {
 	display: inline-block;
 	margin-right: 8px;
 	padding: 0 6px;
@@ -512,3 +512,24 @@
 	color: var(--text-accent);
 	font-size: var(--font-ui-smaller);
 }
+
+/* A trigger is a mechanism, not an attempt, so it is coloured by which
+   mechanism it is -- the same three colours flow/trigger_canvas.py writes to
+   the canvas file. State is a modifier on top of the colour rather than a
+   fourth colour, so enablement and liveness stay readable as separate marks. */
+.flow-node-scheduled-task .flow-node-box { fill: rgba(245, 158, 11, 0.16); stroke: #f59e0b; }
+.flow-node-claude-hook .flow-node-box { fill: rgba(16, 185, 129, 0.16); stroke: #10b981; }
+.flow-node-git-hook .flow-node-box { fill: rgba(139, 92, 246, 0.16); stroke: #8b5cf6; }
+.flow-node-trigger.is-disabled .flow-node-box { fill: none; stroke-opacity: 0.45; }
+.flow-node-trigger.is-disabled .flow-node-title,
+.flow-node-trigger.is-disabled .flow-node-sub { opacity: 0.55; }
+
+.flow-group-label {
+	fill: var(--text-muted);
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+}
+.flow-node-trigger.is-out-of-scope .flow-node-box { fill: none; stroke: var(--text-faint); }
+.flow-node-trigger.is-never-observed .flow-node-box { stroke-dasharray: 4 3; }
+.flow-node-trigger.is-liveness-unavailable .flow-node-box { stroke-dasharray: 1 3; }
