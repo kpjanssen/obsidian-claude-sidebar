@@ -9031,6 +9031,14 @@ var FLOW_PLAN_DIRNAME = ".claude/flow-plans";
 // there is one of them.
 var FLOW_TRIGGER_SUFFIX = ".triggers.json";
 
+// The reusable half. A *definition* is the template -- parameters and the
+// steps that use them -- and a plan is one instance of it with arguments
+// bound. Definitions sit beside the plans directory and are version-
+// controlled on the same terms. The pane does not read them: a definition
+// is not a graph document and carries no nodes to draw, so naming the
+// directory here is for the author-a-workflow help and nothing else.
+var FLOW_DEFINITION_DIRNAME = ".claude/flow-workflows";
+
 // Layout constants. Deliberately the same shape as the canvas writer's
 // (`flow/canvas_core.py`), scaled down for a docked pane: the two renderers
 // consume one contract and a reader moving between them should not have to
@@ -10532,13 +10540,22 @@ var FlowGraphPane = class {
     pane.createEl("p", {
       cls: "flow-detail-note",
       text:
-        "A plan is a reusable definition -- the steps, and the model each one runs on -- written before " +
-        "anything runs. Plans live in " + FLOW_PLAN_DIRNAME + "/ and are version-controlled, unlike " +
-        "everything under " + FLOW_RESERVED_DIRNAME + "/. Nothing here is scheduled and nothing runs on " +
-        "its own: authoring a plan writes a file and does not launch anything."
+        "Two things, and the difference is the reusable part. A definition is the template -- the steps, " +
+        "the model each one runs on, and the parameters that change between uses -- and it lives in " +
+        FLOW_DEFINITION_DIRNAME + "/. A plan is one instance of a definition with its arguments bound, " +
+        "and lives in " + FLOW_PLAN_DIRNAME + "/. Both are version-controlled, unlike everything under " +
+        FLOW_RESERVED_DIRNAME + "/. A plan can also be drawn by hand with no definition behind it. " +
+        "Nothing here is scheduled and nothing runs on its own: authoring writes a file and instantiating " +
+        "writes a file, and neither launches anything."
     });
     const recipes = [
-      ["from a blank page", "python -m flow plan --new NAME"],
+      ["a reusable definition, from a blank page", "python -m flow workflow --new NAME"],
+      [
+        "make a plan from that definition",
+        'python -m flow workflow --instantiate NAME --arg subject="..." --as PLAN-NAME'
+      ],
+      ["check every definition", "python -m flow workflow"],
+      ["a one-off plan, from a blank page", "python -m flow plan --new NAME"],
       [
         "from a run that already happened",
         "python -m flow plan --new NAME --from-run --session " + example
@@ -10561,7 +10578,8 @@ var FlowGraphPane = class {
         "Run these from the proj-flow repository, adding --vault " +
         (this.app.vault.adapter.basePath || "PATH-TO-THIS-VAULT") +
         " when it is not the working directory. Reconstruction from a run deliberately strips every " +
-        "model, so the new plan reports as invalid until each step is given one on purpose."
+        "model, so the new plan reports as invalid until each step is given one on purpose. A definition " +
+        "is refused at authoring time for the same reason -- before an argument has ever been bound to it."
     });
   }
 
