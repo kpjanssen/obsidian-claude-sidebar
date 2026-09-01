@@ -6820,6 +6820,42 @@ function newSessionId() {
     return (ch === "x" ? r : (r & 3 | 8)).toString(16);
   });
 }
+// Resolve a candidate string to a real vault file, or null. Absolute/home paths and
+// URLs are skipped. Falls back to basename linkpath resolution (e.g. a bare note name).
+// Module level rather than a method because two unrelated classes need it and
+// neither is the other's base class.
+function resolveVaultPathIn(app, candidate) {
+  if (!candidate) return null;
+  if (candidate.startsWith("/") || candidate.startsWith("~") || candidate.includes("://")) return null;
+  const direct = app.vault.getAbstractFileByPath(candidate);
+  if (direct instanceof import_obsidian.TFile) return direct;
+  const dest = app.metadataCache.getFirstLinkpathDest(candidate, "");
+  if (dest instanceof import_obsidian.TFile) return dest;
+  return null;
+}
+
+// Open (or focus, if already open) a vault file in a markdown leaf -- never replaces the
+// terminal or graph leaf. `subpath` is a heading anchor including its leading "#", passed
+// through as the ephemeral state Obsidian's own internal links use, so a dispatch opens at
+// its own heading rather than at the top of a note holding forty of them.
+async function openVaultFileIn(app, file, subpath) {
+  const options = subpath ? { eState: { subpath } } : void 0;
+  const mdLeaves = app.workspace.getLeavesOfType("markdown");
+  const already = mdLeaves.find((l) => l.view?.file?.path === file.path);
+  if (already) {
+    if (options) await already.openFile(file, options);
+    app.workspace.setActiveLeaf(already, { focus: true });
+    return;
+  }
+  const target = mdLeaves.filter((l) => !l.pinned)[0] || mdLeaves[0];
+  if (target) {
+    await target.openFile(file, options);
+    app.workspace.setActiveLeaf(target, { focus: true });
+  } else {
+    await app.workspace.getLeaf(true).openFile(file, options);
+  }
+}
+
 var TerminalView = class extends import_obsidian.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -7776,30 +7812,12 @@ var TerminalView = class extends import_obsidian.ItemView {
   // Resolve a candidate string to a real vault file, or null. Absolute/home paths and
   // URLs are skipped. Falls back to basename linkpath resolution (e.g. a bare note name).
   resolveVaultPath(candidate) {
-    if (!candidate) return null;
-    if (candidate.startsWith("/") || candidate.startsWith("~") || candidate.includes("://")) return null;
-    const direct = this.app.vault.getAbstractFileByPath(candidate);
-    if (direct instanceof import_obsidian.TFile) return direct;
-    const dest = this.app.metadataCache.getFirstLinkpathDest(candidate, "");
-    if (dest instanceof import_obsidian.TFile) return dest;
-    return null;
+    return resolveVaultPathIn(this.app, candidate);
   }
   // Open (or focus, if already open) a vault file in a markdown leaf — never replaces the
   // terminal leaf. Mirrors the leaf-selection logic in toggleFocus().
   async openVaultFile(file) {
-    const mdLeaves = this.app.workspace.getLeavesOfType("markdown");
-    const already = mdLeaves.find((l) => l.view?.file?.path === file.path);
-    if (already) {
-      this.app.workspace.setActiveLeaf(already, { focus: true });
-      return;
-    }
-    const target = mdLeaves.filter((l) => !l.pinned)[0] || mdLeaves[0];
-    if (target) {
-      await target.openFile(file);
-      this.app.workspace.setActiveLeaf(target, { focus: true });
-    } else {
-      await this.app.workspace.getLeaf(true).openFile(file);
-    }
+    return openVaultFileIn(this.app, file);
   }
   fit() {
     if (!this.term || !this.fitAddon) return;
@@ -9107,8 +9125,26 @@ function flowReadDocument(file) {
 // The few document-level facts the session list needs. Kept separate from the
 // document itself so the pane holds one parsed graph at a time rather than
 // forty.
+// The session node, which is the one node every run graph has exactly one of.
+// Read rather than recomputed: the title the dropdown shows has to be the title
+// the canvas and the index show, and there is only one way to guarantee that.
+function flowSessionNode(document) {
+  for (const node of (document && document.nodes) || []) {
+    if (node.kind === "session") return node;
+  }
+  return null;
+}
+
+// The heading a payload note gives a node, mirroring _anchor() in canvas_core.py.
+// Kept in step by the schema, not by this comment: if that function changes, the
+// wikilinks in the canvas break in the same render that breaks this.
+function flowAnchor(nodeId) {
+  return String(nodeId).replace(/[:|#]/g, "-");
+}
+
 function flowSummarise(entry, document) {
   const counts = (document && document.counts) || {};
+  const session = flowSessionNode(document);
   return {
     file: entry.file,
     project: entry.project,
@@ -9120,7 +9156,11 @@ function flowSummarise(entry, document) {
     dispatches: counts["kind:dispatch"] || 0,
     nodes: counts.nodes || 0,
     widestFanout: counts.widest_fanout || 0,
-    modelInheriting: counts.model_inheriting || 0
+    modelInheriting: counts.model_inheriting || 0,
+    // Null, never a fallback to the id: a caller that wants the id can read
+    // sessionId, and a title that is silently an id is the defect this fixes.
+    title: session ? session["graph.node.name"] || null : null,
+    titleSource: session ? session.title_source || null : null
   };
 }
 
@@ -9573,7 +9613,7 @@ var FlowGraphPane = class {
     for (const summary of this.summaries) {
       const option = select.createEl("option", { value: summary.file });
       const label =
-        summary.sessionId.slice(0, 8) +
+        (summary.title || summary.sessionId.slice(0, 8)) +
         " · " +
         summary.dispatches +
         " dispatches" +
@@ -9926,6 +9966,14 @@ var FlowGraphPane = class {
     // because their absence is itself the finding this project measures.
     row("description", node.summary || "not recorded");
     if (node.summary_source) row("description from", node.summary_source);
+    if (node.kind === "session") {
+      // A session's name comes from a record that may not exist, so the pane
+      // states which one it came from. "session_id" here means the transcript
+      // carried no title -- that is a finding about the transcript, not a
+      // rendering fault, and it is stated rather than hidden behind an id.
+      row("title from", node.title_source || "not recorded");
+      row("project", node.project);
+    }
     if (node.kind === "dispatch") {
       row("agent type", node.agent_type || "not recorded");
       row("model", node.model || "not recorded");
@@ -9958,6 +10006,12 @@ var FlowGraphPane = class {
     }
     row("plan", node.plan_id);
 
+    if (node.kind === "session" && node.last_prompt) {
+      const instruction = pane.createDiv({ cls: "flow-detail-section" });
+      instruction.createEl("h4", { text: "last instruction" });
+      instruction.createEl("p", { cls: "flow-detail-instruction", text: node.last_prompt });
+    }
+
     if (Array.isArray(node.vault_touches) && node.vault_touches.length) {
       const touches = pane.createDiv({ cls: "flow-detail-section" });
       touches.createEl("h4", { text: "vault touches (" + node.vault_touches.length + ")" });
@@ -9977,6 +10031,12 @@ var FlowGraphPane = class {
       const counts = Object.entries(node.interior.tool_counts).sort((a, b) => b[1] - a[1]);
       row("tools", counts.map((c) => c[0] + "×" + c[1]).join(", "));
     }
+
+    // Where this node can be read in full. The payload note and the canvas are
+    // in the vault and open; the transcript is not, so its path is stated
+    // rather than offered as a button -- a control that cannot work is worse
+    // than a path that can be copied.
+    this.renderOpenActions(pane, node);
 
     if (node.kind !== "dispatch") return;
 
@@ -10003,6 +10063,52 @@ var FlowGraphPane = class {
         text: "payload read from " + (payload.source.file || "an unrecorded file")
       });
     }
+  }
+
+  // The two vault files this document was rendered into, and the one file it was
+  // rendered from. Paths are derived from the document's own project and
+  // session_id rather than from the loaded file path, so what the pane offers to
+  // open is what the generator states it wrote.
+  renderOpenActions(pane, node) {
+    const doc = this.document || {};
+    if (!doc.project || !doc.session_id) return;
+    const stem = FLOW_RESERVED_DIRNAME + "/" + doc.project + "/" + doc.session_id;
+    const section = pane.createDiv({ cls: "flow-detail-section" });
+    section.createEl("h4", { text: "open" });
+    const actions = section.createDiv({ cls: "flow-detail-actions" });
+    const anchor = node.kind === "dispatch" ? "#" + flowAnchor(node["graph.node.id"]) : null;
+    this.addOpenButton(
+      actions,
+      anchor ? "payload note, at this dispatch" : "payload note",
+      stem + " payloads.md",
+      anchor
+    );
+    this.addOpenButton(actions, "canvas", stem + ".canvas", null);
+    if (doc.profile && doc.session_file) {
+      section.createDiv({
+        cls: "flow-detail-note",
+        text:
+          "transcript: " +
+          path.join(doc.profile, doc.session_file) +
+          " — outside the vault, so Obsidian cannot open it."
+      });
+    }
+  }
+
+  // One button, or the reason there is no button. A path that does not resolve
+  // is reported as missing rather than rendered as a control that does nothing,
+  // because everything under the reserved directory is disposable and a stale
+  // pane pointing at a deleted render is the expected case, not a fault.
+  addOpenButton(container, label, vaultPath, subpath) {
+    const file = resolveVaultPathIn(this.app, vaultPath);
+    if (!file) {
+      container.createSpan({ cls: "flow-detail-note", text: label + ": not in the vault (" + vaultPath + ")" });
+      return;
+    }
+    const button = container.createEl("button", { cls: "flow-detail-open", text: label });
+    button.addEventListener("click", () => {
+      openVaultFileIn(this.app, file, subpath || null);
+    });
   }
 
   // A bounded excerpt with an explicit control to reveal the rest. Nothing is
