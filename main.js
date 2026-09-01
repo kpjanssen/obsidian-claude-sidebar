@@ -10555,6 +10555,14 @@ var FlowGraphPane = class {
         'python -m flow workflow --instantiate NAME --arg subject="..." --as PLAN-NAME'
       ],
       ["check every definition", "python -m flow workflow"],
+      [
+        "what would this definition's schedule fire, and when",
+        "python -m flow workflow --materialise NAME"
+      ],
+      [
+        "compare a definition's schedule against what this machine holds",
+        "python -m flow workflow --drift NAME"
+      ],
       ["a one-off plan, from a blank page", "python -m flow plan --new NAME"],
       [
         "from a run that already happened",
@@ -10579,7 +10587,10 @@ var FlowGraphPane = class {
         (this.app.vault.adapter.basePath || "PATH-TO-THIS-VAULT") +
         " when it is not the working directory. Reconstruction from a run deliberately strips every " +
         "model, so the new plan reports as invalid until each step is given one on purpose. A definition " +
-        "is refused at authoring time for the same reason -- before an argument has ever been bound to it."
+        "is refused at authoring time for the same reason -- before an argument has ever been bound to it. " +
+        "--materialise on its own only states what a definition's schedule would fire and writes nothing; " +
+        "registering it means repeating that statement back with --confirm, and the task is created " +
+        "disabled unless --enable was asked for in the same command."
     });
   }
 
