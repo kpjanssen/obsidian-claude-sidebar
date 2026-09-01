@@ -9017,6 +9017,13 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
 var FLOW_RESERVED_DIRNAME = "_flow";
 var FLOW_GRAPH_SUFFIX = ".graph.json";
 
+// The other document a reader can open here. A plan is an authored definition
+// of work that could run; it lives outside the reserved directory on purpose,
+// because everything under `_flow/` is disposable generated state and a plan
+// is work someone wrote and expects the repository to keep.
+var FLOW_PLAN_SUFFIX = ".plan.json";
+var FLOW_PLAN_DIRNAME = ".claude/flow-plans";
+
 // Layout constants. Deliberately the same shape as the canvas writer's
 // (`flow/canvas_core.py`), scaled down for a docked pane: the two renderers
 // consume one contract and a reader moving between them should not have to
@@ -9072,6 +9079,50 @@ function flowGraphRoot(app) {
   return path.join(base, FLOW_RESERVED_DIRNAME);
 }
 
+// Where authored plans live. Kept separate from flowGraphRoot rather than
+// folded into it: the two directories are under different contracts -- one is
+// regenerated output that a render may freely replace, the other is authored
+// work that nothing here may touch -- and one function returning both would
+// make it easy for a later caller to forget which it was holding.
+function flowPlanRoot(app) {
+  const base = app.vault.adapter.basePath || "";
+  if (!base) return null;
+  return path.join(base, ".claude", "flow-plans");
+}
+
+// Every `.plan.json` directly under the plans directory, newest first. Flat,
+// not per-project: a plan is not owned by a session, which is the whole point
+// of it being reusable.
+function flowListPlanFiles(root) {
+  const found = [];
+  let files;
+  try {
+    files = fs.readdirSync(root, { withFileTypes: true });
+  } catch (err) {
+    return { found, error: err };
+  }
+  for (const file of files) {
+    if (!file.isFile() || !file.name.endsWith(FLOW_PLAN_SUFFIX)) continue;
+    const full = path.join(root, file.name);
+    let stat = null;
+    try {
+      stat = fs.statSync(full);
+    } catch (err) {
+      continue;
+    }
+    found.push({
+      file: full,
+      documentClass: "plan",
+      project: FLOW_PLAN_DIRNAME,
+      sessionId: file.name.slice(0, -FLOW_PLAN_SUFFIX.length),
+      mtimeMs: stat.mtimeMs,
+      size: stat.size
+    });
+  }
+  found.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return { found, error: null };
+}
+
 // Every `.graph.json` under `_flow/<project>/`, newest first. Statted rather
 // than read: the list is cheap and the parse is not.
 function flowListDocumentFiles(root) {
@@ -9102,6 +9153,7 @@ function flowListDocumentFiles(root) {
       }
       found.push({
         file: full,
+        documentClass: "run",
         project: entry.name,
         sessionId: file.name.slice(0, -FLOW_GRAPH_SUFFIX.length),
         mtimeMs: stat.mtimeMs,
@@ -9135,6 +9187,18 @@ function flowSessionNode(document) {
   return null;
 }
 
+// The node everything else hangs off, whatever kind of document this is. A run
+// graph roots at its session; a plan roots at an orchestrator, because a plan
+// is a definition and no session has run it. Found by structure -- the one
+// node with no recorded parent -- rather than by a list of kinds, so a later
+// document kind needs no third branch here.
+function flowRootNode(document) {
+  for (const node of (document && document.nodes) || []) {
+    if (!node["graph.node.parent_id"]) return node;
+  }
+  return null;
+}
+
 // The heading a payload note gives a node, mirroring _anchor() in canvas_core.py.
 // Kept in step by the schema, not by this comment: if that function changes, the
 // wikilinks in the canvas break in the same render that breaks this.
@@ -9145,6 +9209,7 @@ function flowAnchor(nodeId) {
 function flowSummarise(entry, document) {
   const counts = (document && document.counts) || {};
   const session = flowSessionNode(document);
+  const root = session || flowRootNode(document);
   return {
     file: entry.file,
     project: entry.project,
@@ -9159,8 +9224,13 @@ function flowSummarise(entry, document) {
     modelInheriting: counts.model_inheriting || 0,
     // Null, never a fallback to the id: a caller that wants the id can read
     // sessionId, and a title that is silently an id is the defect this fixes.
-    title: session ? session["graph.node.name"] || null : null,
-    titleSource: session ? session.title_source || null : null
+    title: root ? root["graph.node.name"] || null : null,
+    titleSource: session ? session.title_source || null : null,
+    // What the session was asked for, which its title does not say. Null on a
+    // plan, which has been asked nothing yet, and null on a session whose
+    // transcript opened with no human turn -- absent stays absent.
+    firstPrompt: session ? session.first_prompt || null : null,
+    documentClass: entry.documentClass || "run"
   };
 }
 
@@ -9204,7 +9274,7 @@ function flowLayout(document) {
   // column index -> the first y in that column that is still free.
   const floors = new Map();
   const nodes = document.nodes || [];
-  const session = nodes.find((n) => n.kind === "session") || null;
+  const root = flowRootNode(document);
   let widestColumn = 0;
 
   function floorOf(column) {
@@ -9276,8 +9346,8 @@ function flowLayout(document) {
     return { bottom, width: width + nested };
   }
 
-  if (session) {
-    const topLevel = children.get(session["graph.node.id"]) || [];
+  if (root) {
+    const topLevel = children.get(root["graph.node.id"]) || [];
     let base = 1;
     let run = 0;
     let groupWidth = 1;
@@ -9294,7 +9364,7 @@ function flowLayout(document) {
       groupWidth = Math.max(groupWidth, placed.width);
       run = placed.bottom + FLOW_BAND_GAP;
     }
-    put(session, 0, 0);
+    put(root, 0, 0);
   }
 
   // Anything the walk did not reach — a node whose recorded parent is not in
@@ -9356,6 +9426,15 @@ function flowSubFace(node) {
   return parts.join(" · ");
 }
 
+// The hover text. A session gets the instruction it opened with underneath its
+// title, because the title says what the session was called and not what it
+// was asked for -- and being unable to tell those apart was the complaint.
+function flowTooltip(node) {
+  const lines = [flowFace(node), flowSubFace(node)];
+  if (node.kind === "session" && node.first_prompt) lines.push("asked: " + node.first_prompt);
+  return lines.join("\n");
+}
+
 function flowNodeClass(node) {
   const kind = node.kind || "";
   if (kind === "session") return "flow-node-session";
@@ -9380,6 +9459,12 @@ function flowIsModelInheriting(node) {
 // 3.3). A version outside it is refused by name, never guessed at.
 var FLOW_SUPPORTED_SCHEMA_VERSIONS = [1, 2];
 
+// The document kinds this pane can lay out, likewise closed. `run` is a record
+// of work that happened; `plan` is a definition of work that could happen;
+// `trigger-inventory` is what is scheduled against those definitions. Anything
+// else is refused by name rather than drawn on a guess.
+var FLOW_SUPPORTED_KINDS = ["run", "plan", "trigger-inventory"];
+
 // Version 1 predates `kind` and defined no document this pane could confuse
 // a run graph with -- docs/graph-schema.md: "A version-1 document is a run
 // graph... because version 1 defined no other kind." That is a fact about
@@ -9390,13 +9475,12 @@ function flowDocumentKind(doc) {
   return doc.kind;
 }
 
-// Refuses an unknown schema_version or a non-run kind by naming what was
-// found, and never draws it. This pane only ever lists files under the
-// `.graph.json` suffix the run-graph kind alone uses (flowListDocumentFiles),
-// so in the store as it exists today this is a second line of defence -- but
-// the suffix is a filesystem convention and the document's own `kind` field
-// is the fact of record, so a renderer that trusted the filename over the
-// field would be exactly the guessing this guard exists to forbid.
+// Refuses an unknown schema_version or an unsupported kind by naming what was
+// found, and never draws it. The pane lists two suffixes and each is written
+// by one kind today, so on the store as it exists this is a second line of
+// defence -- but a suffix is a filesystem convention and the document's own
+// `kind` field is the fact of record, so a renderer that trusted the filename
+// over the field would be exactly the guessing this guard exists to forbid.
 function flowValidateDocument(doc) {
   if (!doc || typeof doc !== "object") {
     return { ok: false, problem: "This file does not hold a JSON object." };
@@ -9415,10 +9499,15 @@ function flowValidateDocument(doc) {
     return { ok: false, problem: "schema_version 2 requires kind, and this document has none." };
   }
   const kind = flowDocumentKind(doc);
-  if (kind !== "run") {
+  if (FLOW_SUPPORTED_KINDS.indexOf(kind) === -1) {
     return {
       ok: false,
-      problem: "This view draws run graphs only, and this document's kind is " + JSON.stringify(kind) + "."
+      problem:
+        "This view draws " +
+        FLOW_SUPPORTED_KINDS.join(", ") +
+        " documents, and this document's kind is " +
+        JSON.stringify(kind) +
+        "."
     };
   }
   return { ok: true, problem: null };
@@ -9452,6 +9541,8 @@ var FlowGraphPane = class {
     this.app = view.app;
     this.hostEl = hostEl;
     this.root = flowGraphRoot(view.app);
+    this.planRoot = flowPlanRoot(view.app);
+    this.watchers = [];
     this.summaries = [];
     this.summaryCache = new Map();
     this.selectedFile = null;
@@ -9462,7 +9553,6 @@ var FlowGraphPane = class {
     this.scale = 1;
     this.tx = 0;
     this.ty = 0;
-    this.watcher = null;
     this.watchAvailable = false;
     this.watchTimer = null;
     this.destroyed = false;
@@ -9479,6 +9569,10 @@ var FlowGraphPane = class {
     this.sessionSelect.addEventListener("change", () => {
       this.select(this.sessionSelect.value, { keepSelection: false });
     });
+    // Ask (c): somewhere visible that says a workflow can be authored at all.
+    const create = bar.createEl("button", { cls: "flow-icon-button", text: "New workflow" });
+    create.setAttribute("aria-label", "How to author a reusable workflow plan");
+    create.addEventListener("click", () => this.renderCreateHelp());
     const refresh = bar.createEl("button", { cls: "flow-icon-button", text: "Refresh" });
     refresh.setAttribute("aria-label", "Re-read the run-graph documents from disk");
     refresh.addEventListener("click", () => this.refresh({ keepSelection: true }));
@@ -9517,18 +9611,23 @@ var FlowGraphPane = class {
       return;
     }
     const listing = flowListDocumentFiles(this.root);
-    if (listing.error && listing.error.code === "ENOENT") {
-      this.summaries = [];
-      this.renderEmpty(null);
-      return;
-    }
-    if (listing.error) {
+    // Plans are optional and listed first. A vault that has never authored one
+    // has no such directory, and that absence is the normal case rather than
+    // an error to report at the reader.
+    const plans = this.planRoot ? flowListPlanFiles(this.planRoot) : { found: [], error: null };
+    if (listing.error && listing.error.code !== "ENOENT") {
       this.summaries = [];
       this.renderEmpty("Could not read " + this.root + ": " + listing.error.message);
       return;
     }
+    const entries = plans.found.concat(listing.found);
+    if (!entries.length) {
+      this.summaries = [];
+      this.renderEmpty(null);
+      return;
+    }
     const summaries = [];
-    for (const entry of listing.found) {
+    for (const entry of entries) {
       const cached = this.summaryCache.get(entry.file);
       if (cached && cached.mtimeMs === entry.mtimeMs) {
         summaries.push(cached);
@@ -9605,24 +9704,47 @@ var FlowGraphPane = class {
         FLOW_RESERVED_DIRNAME +
         "/ is disposable generated state: deleting it costs nothing and one command regenerates it."
     });
+    box.createEl("h3", { text: "Or author a workflow to run later" });
+    box.createEl("p", {
+      text:
+        "A plan is a reusable definition written before anything runs. It is kept in " +
+        FLOW_PLAN_DIRNAME +
+        "/, which is version-controlled, and it appears in the selector above once it exists."
+    });
+    box.createEl("pre", { cls: "flow-empty-command", text: "python -m flow plan --new NAME" });
   }
 
   renderSessionList() {
     const select = this.sessionSelect;
     select.empty();
-    for (const summary of this.summaries) {
-      const option = select.createEl("option", { value: summary.file });
-      const label =
-        (summary.title || summary.sessionId.slice(0, 8)) +
-        " · " +
-        summary.dispatches +
-        " dispatches" +
-        (summary.widestFanout ? " · fan-out " + summary.widestFanout : "") +
-        (summary.unreadable ? " · unreadable" : "") +
-        (summary.refused ? " · refused" : "");
-      option.textContent = label;
-      option.title = summary.project + " / " + summary.sessionId;
-      if (summary.file === this.selectedFile) option.selected = true;
+    // Grouped by what the document is. A plan is a definition of work that
+    // could run and a run graph is a record of work that did; a flat list of
+    // both invites reading one as the other, which is precisely the confusion
+    // the forward half of this feature has to avoid.
+    const groups = [
+      ["workflows you can run", "plan"],
+      ["runs that already happened", "run"]
+    ];
+    const present = groups.filter(
+      ([, cls]) => this.summaries.some((s) => (s.documentClass || "run") === cls)
+    );
+    for (const [groupLabel, cls] of present) {
+      const holder =
+        present.length > 1 ? select.createEl("optgroup", { attr: { label: groupLabel } }) : select;
+      for (const summary of this.summaries) {
+        if ((summary.documentClass || "run") !== cls) continue;
+        const option = holder.createEl("option", { value: summary.file });
+        option.textContent =
+          (summary.title || summary.sessionId.slice(0, 8)) +
+          " · " +
+          summary.dispatches +
+          (cls === "plan" ? " steps" : " dispatches") +
+          (summary.widestFanout ? " · fan-out " + summary.widestFanout : "") +
+          (summary.unreadable ? " · unreadable" : "") +
+          (summary.refused ? " · refused" : "");
+        option.title = summary.project + " / " + summary.sessionId;
+        if (summary.file === this.selectedFile) option.selected = true;
+      }
     }
   }
 
@@ -9642,6 +9764,12 @@ var FlowGraphPane = class {
     }
     const doc = this.document;
     if (!doc) return;
+    if (flowDocumentKind(doc) === "plan") {
+      status.createSpan({
+        cls: "flow-status-plan",
+        text: "PLAN \u2014 work that could run, not a record of work that did"
+      });
+    }
     const counts = doc.counts || {};
     const facts = [
       "schema " + (doc.schema_version === undefined ? "unrecorded" : doc.schema_version),
@@ -9700,6 +9828,12 @@ var FlowGraphPane = class {
     const canvas = this.canvasEl;
     canvas.empty();
     const doc = this.document;
+    // A plan is a definition of work that could run; a run graph is a record of
+    // work that did. `workflow-plans` requires the first is never mistaken for
+    // the second, and a renderer that drew them identically would break that
+    // requirement whatever the document itself said. Dashed boxes, so the two
+    // stay distinguishable at a glance with the status line scrolled away.
+    canvas.classList.toggle("is-plan", flowDocumentKind(doc || {}) === "plan");
     // task 3.3: named and refused before anything is laid out or drawn --
     // flowLayout() and the node loop below never run on a document that
     // failed flowValidateDocument().
@@ -9792,7 +9926,7 @@ var FlowGraphPane = class {
       sub.textContent = flowClip(flowSubFace(node), 30);
       group.appendChild(sub);
       const tip = flowSvg("title", {});
-      tip.textContent = flowFace(node) + "\n" + flowSubFace(node);
+      tip.textContent = flowTooltip(node);
       group.appendChild(tip);
       group.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -10006,6 +10140,22 @@ var FlowGraphPane = class {
     }
     row("plan", node.plan_id);
 
+    if (node.kind === "session" && node.first_prompt) {
+      const asked = pane.createDiv({ cls: "flow-detail-section" });
+      asked.createEl("h4", { text: "asked" });
+      asked.createEl("p", { cls: "flow-detail-instruction", text: node.first_prompt });
+    }
+
+    // No transcript carries a written summary -- measured across the store, the
+    // record type does not exist -- so the opening instruction is the closest
+    // recorded thing to one, and its absence is stated rather than papered over.
+    if (node.kind === "session" && !node.first_prompt && !node.last_prompt) {
+      pane.createDiv({
+        cls: "flow-detail-note",
+        text: "Neither an opening nor a closing instruction was recorded for this session."
+      });
+    }
+
     if (node.kind === "session" && node.last_prompt) {
       const instruction = pane.createDiv({ cls: "flow-detail-section" });
       instruction.createEl("h4", { text: "last instruction" });
@@ -10071,6 +10221,22 @@ var FlowGraphPane = class {
   // open is what the generator states it wrote.
   renderOpenActions(pane, node) {
     const doc = this.document || {};
+    // A plan is not under the vault's indexed tree -- `.claude/` is a dot
+    // directory and Obsidian does not see into it -- so there is nothing to
+    // open and the honest thing is to state where the file is.
+    if (flowDocumentKind(doc) === "plan") {
+      const section = pane.createDiv({ cls: "flow-detail-section" });
+      section.createEl("h4", { text: "where this plan lives" });
+      section.createEl("pre", { cls: "flow-empty-command", text: this.selectedFile || "unrecorded" });
+      if (this.selectedFile && this.selectedFile.endsWith(FLOW_PLAN_SUFFIX)) {
+        const stem = this.selectedFile.slice(0, -FLOW_PLAN_SUFFIX.length);
+        section.createDiv({
+          cls: "flow-detail-note",
+          text: "Its canvas sits beside it at " + stem + ".canvas, and Obsidian cannot index that either."
+        });
+      }
+      return;
+    }
     if (!doc.project || !doc.session_id) return;
     const stem = FLOW_RESERVED_DIRNAME + "/" + doc.project + "/" + doc.session_id;
     const section = pane.createDiv({ cls: "flow-detail-section" });
@@ -10085,14 +10251,75 @@ var FlowGraphPane = class {
     );
     this.addOpenButton(actions, "canvas", stem + ".canvas", null);
     if (doc.profile && doc.session_file) {
+      const full = path.join(doc.profile, doc.session_file);
       section.createDiv({
         cls: "flow-detail-note",
-        text:
-          "transcript: " +
-          path.join(doc.profile, doc.session_file) +
-          " — outside the vault, so Obsidian cannot open it."
+        text: "transcript: " + full + " — outside the vault, so Obsidian cannot open it."
       });
+      // The pane launches nothing and opens nothing outside the vault. Handing
+      // the path to the clipboard is the most it can honestly do.
+      this.addCopyButton(section, "copy transcript path", full);
     }
+  }
+
+  // The clipboard is the one thing the pane may reach outside its own DOM: it
+  // writes no file, launches no process and needs no permission the reader has
+  // not just granted by clicking.
+  addCopyButton(container, label, text) {
+    const button = container.createEl("button", { cls: "flow-detail-open", text: label });
+    button.addEventListener("click", () => {
+      try {
+        navigator.clipboard.writeText(text);
+        button.textContent = "copied";
+      } catch (err) {
+        button.textContent = "clipboard unavailable";
+      }
+    });
+  }
+
+  // Ask (c) proper: how a workflow gets authored. The pane is a reader and
+  // writes nothing outside its own DOM -- task 8.7 fixes that as a property,
+  // not a preference -- so the affordance is the exact commands that do author
+  // one, with a copy control, rather than a button that silently runs
+  // something on the reader's machine.
+  renderCreateHelp() {
+    const pane = this.detailEl;
+    pane.empty();
+    this.selectedNodeId = null;
+    const doc = this.document || {};
+    const example =
+      flowDocumentKind(doc) === "run" && doc.session_id ? String(doc.session_id).slice(0, 8) : "SESSION-ID";
+    pane.createEl("h3", { cls: "flow-detail-title", text: "Author a workflow" });
+    pane.createEl("p", {
+      cls: "flow-detail-note",
+      text:
+        "A plan is a reusable definition -- the steps, and the model each one runs on -- written before " +
+        "anything runs. Plans live in " + FLOW_PLAN_DIRNAME + "/ and are version-controlled, unlike " +
+        "everything under " + FLOW_RESERVED_DIRNAME + "/. Nothing here is scheduled and nothing runs on " +
+        "its own: authoring a plan writes a file and does not launch anything."
+    });
+    const recipes = [
+      ["from a blank page", "python -m flow plan --new NAME"],
+      [
+        "from a run that already happened",
+        "python -m flow plan --new NAME --from-run --session " + example
+      ],
+      ["check every plan for a step that names no model", "python -m flow plan"]
+    ];
+    for (const [label, command] of recipes) {
+      const box = pane.createDiv({ cls: "flow-detail-section" });
+      box.createEl("h4", { text: label });
+      box.createEl("pre", { cls: "flow-empty-command", text: command });
+      this.addCopyButton(box, "copy", command);
+    }
+    pane.createDiv({
+      cls: "flow-detail-note",
+      text:
+        "Run these from the proj-flow repository, adding --vault " +
+        (this.app.vault.adapter.basePath || "PATH-TO-THIS-VAULT") +
+        " when it is not the working directory. Reconstruction from a run deliberately strips every " +
+        "model, so the new plan reports as invalid until each step is given one on purpose."
+    });
   }
 
   // One button, or the reason there is no button. A path that does not resolve
@@ -10159,27 +10386,34 @@ var FlowGraphPane = class {
   // this watch to a synchronised or version-controlled folder is a new risk
   // rather than a bigger version of this one.
   startWatching() {
-    if (!this.root) return;
-    try {
-      this.watcher = fs.watch(this.root, { recursive: true }, () => this.onWatchEvent());
+    this.watchers = [];
+    // Both roots, because a plan authored while the pane is open is exactly
+    // the case the forward half of this feature exists for. A directory that
+    // does not exist yet simply is not watchable; Refresh still finds it.
+    for (const dir of [this.root, this.planRoot]) {
+      if (!dir) continue;
+      let watcher = null;
+      try {
+        watcher = fs.watch(dir, { recursive: true }, () => this.onWatchEvent());
+      } catch (err) {
+        continue;
+      }
       // A watch that dies mid-session leaves the view silently stale, so the
       // status line is redrawn to say so and point at Refresh.
-      this.watcher.on("error", () => {
+      watcher.on("error", () => {
         this.stopWatching(true);
         if (!this.destroyed && this.statusEl) this.renderStatus();
       });
-      this.watchAvailable = true;
-    } catch (err) {
-      this.watcher = null;
-      this.watchAvailable = false;
+      this.watchers.push(watcher);
     }
+    this.watchAvailable = this.watchers.length > 0;
   }
 
   stopWatching(markUnavailable) {
-    if (this.watcher) {
-      try { this.watcher.close(); } catch (_) {}
-      this.watcher = null;
+    for (const watcher of this.watchers || []) {
+      try { watcher.close(); } catch (_) {}
     }
+    this.watchers = [];
     if (markUnavailable) this.watchAvailable = false;
     if (this.watchTimer) {
       window.clearTimeout(this.watchTimer);

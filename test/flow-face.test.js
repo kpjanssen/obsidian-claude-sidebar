@@ -26,7 +26,7 @@ function loadRegion() {
   }
   return new Function(
     source.slice(from, to) +
-      "\nreturn { flowSessionNode, flowAnchor, flowSummarise, flowFace };"
+      "\nreturn { flowSessionNode, flowRootNode, flowAnchor, flowSummarise, flowFace," + " flowTooltip, flowValidateDocument, FLOW_SUPPORTED_KINDS };"
   )();
 }
 
@@ -101,6 +101,92 @@ equal(
   "a session with no summary is drawn by its name"
 );
 
+// ---- a session carries what it was asked, and says so when it was not -----
+// No transcript record type holds a written summary -- that was measured over
+// the store, not assumed -- so the opening human instruction is the nearest
+// recorded thing to one. Its absence has to read as absence.
+const asked = {
+  kind: "session",
+  "graph.node.name": "Rename plugin to proj-flow",
+  title_source: "ai_title",
+  first_prompt: "rename the plugin everywhere and keep the deployed copy in step"
+};
+equal(
+  F.flowSummarise(ENTRY, documentWith(asked)).firstPrompt,
+  "rename the plugin everywhere and keep the deployed copy in step",
+  "the summary carries the opening instruction"
+);
+equal(
+  F.flowSummarise(ENTRY, documentWith(titled)).firstPrompt,
+  null,
+  "a session with no recorded opening instruction reports null, not an invented one"
+);
+check(
+  F.flowTooltip(asked).indexOf("asked: rename the plugin") !== -1,
+  "the hover text states what the session was asked"
+);
+check(
+  F.flowTooltip(titled).indexOf("asked:") === -1,
+  "a session with no opening instruction gets no asked line rather than an empty one"
+);
+
+// ---- a plan is a document this view accepts and names ---------------------
+// The forward half. A plan has no session node at all: it is a definition of
+// work that could run, so its name has to come from its root node, and the
+// validator has to stop refusing it.
+const PLAN_ENTRY = {
+  file: "/x/nightly-sweep.plan.json",
+  documentClass: "plan",
+  project: ".claude/flow-plans",
+  sessionId: "nightly-sweep",
+  mtimeMs: 0
+};
+const planDocument = {
+  schema_version: 2,
+  kind: "plan",
+  nodes: [
+    { kind: "orchestrator", "graph.node.id": "orchestrator:root", "graph.node.name": "nightly-sweep" },
+    {
+      kind: "dispatch",
+      "graph.node.id": "dispatch:1",
+      "graph.node.parent_id": "orchestrator:root",
+      "graph.node.name": "sweep"
+    }
+  ],
+  counts: { "kind:dispatch": 1, nodes: 2 }
+};
+equal(F.flowSessionNode(planDocument), null, "a plan has no session node");
+equal(
+  F.flowRootNode(planDocument)["graph.node.id"],
+  "orchestrator:root",
+  "the root of a plan is the node with no recorded parent"
+);
+const planSummary = F.flowSummarise(PLAN_ENTRY, planDocument);
+equal(planSummary.title, "nightly-sweep", "a plan is named by its root node");
+equal(planSummary.titleSource, null, "a plan claims no title_source, because it has no session record");
+equal(planSummary.firstPrompt, null, "a plan has been asked nothing yet");
+equal(planSummary.documentClass, "plan", "the summary states which of the two kinds of document this is");
+
+// ---- the validator accepts exactly the published kinds --------------------
+check(F.flowValidateDocument(planDocument).ok, "a plan document is accepted");
+check(
+  F.flowValidateDocument({ schema_version: 2, kind: "trigger-inventory", nodes: [] }).ok,
+  "a trigger inventory is accepted"
+);
+check(
+  !F.flowValidateDocument({ schema_version: 2, kind: "something-else", nodes: [] }).ok,
+  "an unpublished kind is still refused"
+);
+check(
+  !F.flowValidateDocument({ schema_version: 9, kind: "plan", nodes: [] }).ok,
+  "an unsupported schema version is still refused, kind notwithstanding"
+);
+equal(
+  F.FLOW_SUPPORTED_KINDS.join(","),
+  "run,plan,trigger-inventory",
+  "the accepted set is the published one and nothing more"
+);
+
 // ---- and the real store, when it is there ---------------------------------
 // The QA finding mechanised: every document the generator has actually written
 // should carry a title from a title record, not from its own id.
@@ -123,6 +209,28 @@ equal(
   }
   check(fromId === 0, fromId + " of " + seen + " real document(s) are still named by their id");
   console.log("checked " + seen + " document(s) from " + store);
+})();
+
+// Every plan actually on disk, when the directory is reachable. Points at the
+// same failure from the other side: a plan the pane cannot name is a plan the
+// selector shows as a bare filename.
+(function theRealPlans() {
+  const dir = process.env.FLOW_PLANS;
+  if (!dir || !fs.existsSync(dir)) return;
+  let seen = 0;
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith(".plan.json")) continue;
+    const document = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+    check(F.flowValidateDocument(document).ok, "real plan " + file + " is accepted by the validator");
+    const root = F.flowRootNode(document);
+    check(root !== null, "real plan " + file + " has a root node");
+    check(
+      !!(root && root["graph.node.name"]),
+      "real plan " + file + " names itself rather than leaving the selector to the filename"
+    );
+    seen += 1;
+  }
+  console.log("checked " + seen + " plan(s) from " + dir);
 })();
 
 console.log((checks - failures) + "/" + checks + " face checks passed");
