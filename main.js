@@ -9325,6 +9325,65 @@ function flowNodeClass(node) {
   return "flow-node-dispatch";
 }
 
+// True only when the document's own field says so (task 6.1/6.2). No
+// fallback and no inference from `model` being absent: `model_inheriting` is
+// the one field the contract already computed this from, and re-deriving it
+// here from some other field would be exactly the second implementation the
+// fork-region banner at the top of this section forbids. A document with no
+// model-inheriting dispatches therefore highlights nothing, by construction
+// rather than by a separate zero-check.
+function flowIsModelInheriting(node) {
+  return node.model_inheriting === true;
+}
+
+// The published contract's closed set of supported schema versions (task
+// 3.3). A version outside it is refused by name, never guessed at.
+var FLOW_SUPPORTED_SCHEMA_VERSIONS = [1, 2];
+
+// Version 1 predates `kind` and defined no document this pane could confuse
+// a run graph with -- docs/graph-schema.md: "A version-1 document is a run
+// graph... because version 1 defined no other kind." That is a fact about
+// version 1, not a default: an absent `kind` at version 2 or later is a
+// refusal, not a guess.
+function flowDocumentKind(doc) {
+  if (doc.schema_version === 1) return doc.kind || "run";
+  return doc.kind;
+}
+
+// Refuses an unknown schema_version or a non-run kind by naming what was
+// found, and never draws it. This pane only ever lists files under the
+// `.graph.json` suffix the run-graph kind alone uses (flowListDocumentFiles),
+// so in the store as it exists today this is a second line of defence -- but
+// the suffix is a filesystem convention and the document's own `kind` field
+// is the fact of record, so a renderer that trusted the filename over the
+// field would be exactly the guessing this guard exists to forbid.
+function flowValidateDocument(doc) {
+  if (!doc || typeof doc !== "object") {
+    return { ok: false, problem: "This file does not hold a JSON object." };
+  }
+  const version = doc.schema_version;
+  if (FLOW_SUPPORTED_SCHEMA_VERSIONS.indexOf(version) === -1) {
+    return {
+      ok: false,
+      problem:
+        "Unsupported schema_version " +
+        (version === undefined ? "(none recorded)" : JSON.stringify(version)) +
+        " -- this view knows " + FLOW_SUPPORTED_SCHEMA_VERSIONS.join(" and ") + "."
+    };
+  }
+  if (version >= 2 && !doc.kind) {
+    return { ok: false, problem: "schema_version 2 requires kind, and this document has none." };
+  }
+  const kind = flowDocumentKind(doc);
+  if (kind !== "run") {
+    return {
+      ok: false,
+      problem: "This view draws run graphs only, and this document's kind is " + JSON.stringify(kind) + "."
+    };
+  }
+  return { ok: true, problem: null };
+}
+
 function flowStamp(value) {
   const text = String(value || "");
   if (text.length >= 19) return text.slice(0, 19).replace("T", " ") + " UTC";
@@ -9438,6 +9497,7 @@ var FlowGraphPane = class {
       const read = flowReadDocument(entry.file);
       const summary = flowSummarise(entry, read.document);
       summary.unreadable = read.error ? read.error.message : null;
+      summary.refused = !read.error && read.document ? flowValidateDocument(read.document).problem : null;
       this.summaryCache.set(entry.file, summary);
       summaries.push(summary);
     }
@@ -9459,6 +9519,11 @@ var FlowGraphPane = class {
     const read = flowReadDocument(file);
     this.document = read.document;
     this.documentError = read.error ? read.error.message : null;
+    // task 3.3: checked on every selection, not only on first load, so that
+    // watching a file change into an unsupported version or a non-run kind
+    // is caught the same way opening it fresh would be.
+    this.documentProblem =
+      !this.documentError && this.document ? flowValidateDocument(this.document).problem : null;
     if (!keepSelection) {
       this.selectedNodeId = null;
       this.expandedPayloads.clear();
@@ -9513,7 +9578,8 @@ var FlowGraphPane = class {
         summary.dispatches +
         " dispatches" +
         (summary.widestFanout ? " · fan-out " + summary.widestFanout : "") +
-        (summary.unreadable ? " · unreadable" : "");
+        (summary.unreadable ? " · unreadable" : "") +
+        (summary.refused ? " · refused" : "");
       option.textContent = label;
       option.title = summary.project + " / " + summary.sessionId;
       if (summary.file === this.selectedFile) option.selected = true;
@@ -9525,6 +9591,13 @@ var FlowGraphPane = class {
     status.empty();
     if (this.documentError) {
       status.createSpan({ cls: "flow-status-problem", text: "Could not read this document: " + this.documentError });
+      return;
+    }
+    if (this.documentProblem) {
+      status.createSpan({
+        cls: "flow-status-problem",
+        text: "Refusing to draw this document: " + this.documentProblem
+      });
       return;
     }
     const doc = this.document;
@@ -9540,6 +9613,10 @@ var FlowGraphPane = class {
     ];
     if (counts["outcome:unresolved"]) facts.push(counts["outcome:unresolved"] + " unresolved");
     if (counts["outcome:errored"]) facts.push(counts["outcome:errored"] + " errored");
+    // task 6.1: the per-session count, shown only when it is not zero -- a
+    // fact list that always carried "0 model-inheriting" would be noise on
+    // the common case and would not read as an alert on the uncommon one.
+    if (counts.model_inheriting) facts.push(counts.model_inheriting + " model-inheriting");
     status.createSpan({ cls: "flow-status-facts", text: facts.join(" · ") });
 
     const skipped = doc.skipped_lines && doc.skipped_lines.total;
@@ -9583,6 +9660,14 @@ var FlowGraphPane = class {
     const canvas = this.canvasEl;
     canvas.empty();
     const doc = this.document;
+    // task 3.3: named and refused before anything is laid out or drawn --
+    // flowLayout() and the node loop below never run on a document that
+    // failed flowValidateDocument().
+    if (this.documentProblem) {
+      canvas.createDiv({ cls: "flow-empty flow-empty-problem", text: "Refusing to draw this document: " + this.documentProblem });
+      this.renderDetail(null);
+      return;
+    }
     if (!doc || !Array.isArray(doc.nodes)) {
       canvas.createDiv({ cls: "flow-empty", text: "This file holds no nodes." });
       this.renderDetail(null);
@@ -9630,8 +9715,12 @@ var FlowGraphPane = class {
       const id = node["graph.node.id"];
       const point = laid.positions.get(id);
       if (!point) continue;
+      const inheriting = flowIsModelInheriting(node);
       const group = flowSvg("g", {
-        class: "flow-node " + flowNodeClass(node) + (id === this.selectedNodeId ? " is-selected" : ""),
+        class:
+          "flow-node " + flowNodeClass(node) +
+          (inheriting ? " flow-node-model-inherited" : "") +
+          (id === this.selectedNodeId ? " is-selected" : ""),
         transform: "translate(" + point.x + "," + point.y + ")",
         tabindex: "0",
         role: "button",
@@ -9640,6 +9729,22 @@ var FlowGraphPane = class {
       group.appendChild(
         flowSvg("rect", { class: "flow-node-box", x: 0, y: 0, rx: 6, ry: 6, width: FLOW_NODE_W, height: FLOW_NODE_H })
       );
+      if (inheriting) {
+        // task 6.1/6.2: a corner badge rather than color alone, and drawn
+        // only for a node this document itself marked `model_inheriting`
+        // true -- see flowIsModelInheriting for why nothing here re-derives
+        // that from `model` being absent.
+        const badge = flowSvg("circle", {
+          class: "flow-node-inherited-badge",
+          cx: FLOW_NODE_W - 9,
+          cy: 9,
+          r: 4
+        });
+        const badgeTitle = flowSvg("title", {});
+        badgeTitle.textContent = "model inherited from the session, not pinned";
+        badge.appendChild(badgeTitle);
+        group.appendChild(badge);
+      }
       const title = flowSvg("text", { class: "flow-node-title", x: 10, y: 20 });
       title.textContent = flowClip(flowFace(node), 26);
       group.appendChild(title);

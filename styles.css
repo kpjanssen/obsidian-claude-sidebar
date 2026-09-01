@@ -330,6 +330,19 @@
 	stroke-width: 2;
 }
 
+/* Model inherited from the session rather than pinned (task 6.1/6.2). A
+   dashed border plus a corner badge, not a color change alone, so the mark
+   survives a colorblind reading and a printed screenshot. */
+.flow-node-model-inherited .flow-node-box {
+	stroke-dasharray: 3 2;
+}
+
+.flow-node-inherited-badge {
+	fill: var(--color-orange, var(--text-warning, #d97706));
+	stroke: var(--background-primary);
+	stroke-width: 1;
+}
+
 .flow-node:hover .flow-node-box {
 	stroke: var(--text-accent);
 }
