@@ -10563,6 +10563,11 @@ var FlowGraphPane = class {
         "compare a definition's schedule against what this machine holds",
         "python -m flow workflow --drift NAME"
       ],
+      ["what has actually fired, and what it did", "python -m flow fire"],
+      [
+        "fire a definition once, now, and record what happened",
+        "python -m flow fire --definition NAME"
+      ],
       ["a one-off plan, from a blank page", "python -m flow plan --new NAME"],
       [
         "from a run that already happened",
@@ -10590,7 +10595,10 @@ var FlowGraphPane = class {
         "is refused at authoring time for the same reason -- before an argument has ever been bound to it. " +
         "--materialise on its own only states what a definition's schedule would fire and writes nothing; " +
         "registering it means repeating that statement back with --confirm, and the task is created " +
-        "disabled unless --enable was asked for in the same command."
+        "disabled unless --enable was asked for in the same command. A firing writes one record naming " +
+        "the definition, its arguments and the plan it emitted -- including when it refuses, because a " +
+        "trigger that fires every night and refuses every time has still fired, and that is the one " +
+        "worth catching."
     });
   }
 
