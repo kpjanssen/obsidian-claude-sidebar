@@ -6705,7 +6705,11 @@ var import_child_process = require("child_process");
 var path = __toESM(require("path"));
 var fs = __toESM(require("fs"));
 var { StringDecoder } = require("string_decoder");
-var VIEW_TYPE = "vault-terminal";
+// Distinct from the upstream plugin's "vault-terminal". Obsidian keys leaves,
+// saved workspace state and setViewState() on this string, so the fork and the
+// original can both be enabled in one vault without either shadowing the
+// other (task 8.1).
+var VIEW_TYPE = "flow-terminal-view";
 var CLI_BACKENDS = {
   claude: {
     label: "Claude Code",
@@ -6805,6 +6809,17 @@ function findCliBinary(binary, pathStr, extraDirs) {
   }
   return null;
 }
+// A v4 UUID for a Claude Code session id. Claude Code lets a session claim
+// its own id and be pointed back at that exact id later, which is what makes
+// resume exact rather than most-recent.
+function newSessionId() {
+  const c = globalThis.crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (ch) => {
+    const r = Math.random() * 16 | 0;
+    return (ch === "x" ? r : (r & 3 | 8)).toString(16);
+  });
+}
 var TerminalView = class extends import_obsidian.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -6838,6 +6853,13 @@ var TerminalView = class extends import_obsidian.ItemView {
     this.backendKey = null;
     // The provider this tab actually launched with, pinned at startShell().
     this.activeBackendKey = null;
+    // Stable per-view Claude session id. Persisted by getState() into the
+    // workspace layout so a terminal Obsidian restores on startup resumes its
+    // own conversation rather than opening a blank one.
+    this.sessionId = null;
+    this._shellStarted = false;
+    // The run-graph pane, built on first use by showPane().
+    this.flowPane = null;
   }
   getBackendKey() {
     const key = this.backendKey || this.plugin.pluginData.cliBackend || "claude";
@@ -6874,6 +6896,9 @@ var TerminalView = class extends import_obsidian.ItemView {
       const key = RENAMED_BACKENDS[state.backendKey] || state.backendKey;
       if (CLI_BACKENDS[key]) this.backendKey = key;
     }
+    if (state?.sessionId) {
+      this.sessionId = state.sessionId;
+    }
     // If shell already started, restart with new settings
     if (this.proc && (state?.workingDir || state?.yoloMode || state?.continueSession || state?.backendKey)) {
       this.startShell(this.workingDir, this.yoloMode, this.continueSession);
@@ -6885,7 +6910,10 @@ var TerminalView = class extends import_obsidian.ItemView {
     if (this.yoloMode) state.yoloMode = this.yoloMode;
     // Persisted so a one-off provider tab comes back as that provider on restore
     if (this.backendKey) state.backendKey = this.backendKey;
-    // Don't persist continueSession — it's a one-time action
+    // Don't persist continueSession — it's a one-time action.
+    // Do persist the session id: it is what lets a terminal restored on the
+    // next Obsidian launch resume this exact conversation.
+    if (this.sessionId) state.sessionId = this.sessionId;
     return state;
   }
   async onOpen() {
@@ -6905,7 +6933,7 @@ var TerminalView = class extends import_obsidian.ItemView {
             if (this._isDisposed) return;
             this.onOpen();
           } catch (err) {
-            console.error("[Claude Sidebar] Deferred terminal init failed:", err);
+            console.error("[Flow Terminal] Deferred terminal init failed:", err);
           }
         }, 50);
       });
@@ -6935,7 +6963,7 @@ var TerminalView = class extends import_obsidian.ItemView {
             this.startShell(this.workingDir, this.yoloMode, this.continueSession);
           }
         } catch (err) {
-          console.error("[Claude Sidebar] Failed to start shell:", err);
+          console.error("[Flow Terminal] Failed to start shell:", err);
           this.term?.writeln(`\r\n[Failed to start shell: ${err.message}]`);
         }
       }, 10);
@@ -6961,7 +6989,7 @@ var TerminalView = class extends import_obsidian.ItemView {
       }
       this.setupEscapeHandler();
     } catch (err) {
-      console.error("[Claude Sidebar] Failed to initialize terminal:", err);
+      console.error("[Flow Terminal] Failed to initialize terminal:", err);
     }
   }
   setupEscapeHandler() {
@@ -7028,21 +7056,21 @@ var TerminalView = class extends import_obsidian.ItemView {
     try {
       this.dispose();
     } catch (err) {
-      console.error("[Claude Sidebar] Error during terminal cleanup:", err);
+      console.error("[Flow Terminal] Error during terminal cleanup:", err);
     }
   }
   onunload() {
     try {
       this.dispose();
     } catch (err) {
-      console.error("[Claude Sidebar] Error during terminal onunload:", err);
+      console.error("[Flow Terminal] Error during terminal onunload:", err);
     }
   }
   injectCSS() {
-    if (document.getElementById("xterm-css"))
+    if (document.getElementById("flow-terminal-xterm-css"))
       return;
     const style = document.createElement("style");
-    style.id = "xterm-css";
+    style.id = "flow-terminal-xterm-css";
     style.textContent = `/**
  * Copyright (c) 2014 The xterm.js authors. All rights reserved.
  * Copyright (c) 2012-2013, Christopher Jeffrey (MIT License)
@@ -7267,8 +7295,49 @@ var TerminalView = class extends import_obsidian.ItemView {
   buildUI() {
     const container = this.containerEl;
     container.empty();
-    container.addClass("vault-terminal");
-    this.termHost = container.createDiv({ cls: "vault-terminal-host" });
+    container.addClass("flow-terminal");
+    // One view, two surfaces (task 8.5). The terminal is the default and is
+    // fully usable with no run-graph document present: the graph is additive
+    // to the terminal and never a precondition for it.
+    const tabs = container.createDiv({ cls: "flow-view-tabs" });
+    this.terminalTabButton = tabs.createEl("button", { cls: "flow-view-tab is-active", text: "Terminal" });
+    this.graphTabButton = tabs.createEl("button", { cls: "flow-view-tab", text: "Run graph" });
+    this.terminalPaneEl = container.createDiv({ cls: "flow-terminal-pane" });
+    this.graphPaneEl = container.createDiv({ cls: "flow-graph-host" });
+    this.graphPaneEl.style.display = "none";
+    this.termHost = this.terminalPaneEl.createDiv({ cls: "flow-terminal-host" });
+    this.terminalTabButton.addEventListener("click", () => this.showPane("terminal"));
+    this.graphTabButton.addEventListener("click", () => this.showPane("graph"));
+    this.activePane = "terminal";
+  }
+  // Switching to the graph sends nothing to the terminal, and neither does
+  // selecting a node in it (task 8.7). The graph is a record of what happened;
+  // starting a run from it is a separate, gated capability.
+  showPane(which) {
+    if (!this.terminalPaneEl || !this.graphPaneEl) return;
+    this.activePane = which;
+    const terminalActive = which === "terminal";
+    this.terminalPaneEl.style.display = terminalActive ? "flex" : "none";
+    this.graphPaneEl.style.display = terminalActive ? "none" : "flex";
+    this.terminalTabButton.classList.toggle("is-active", terminalActive);
+    this.graphTabButton.classList.toggle("is-active", !terminalActive);
+    if (terminalActive) {
+      // xterm measures a hidden element as zero rows, so refit on the way back.
+      window.setTimeout(() => {
+        try {
+          this.fit();
+          this.term?.focus();
+        } catch (_) {}
+      }, 0);
+      return;
+    }
+    if (!this.flowPane) {
+      // Built on first use: a reader who only ever wants a terminal pays
+      // nothing for the graph — no directory read and no filesystem watch.
+      this.flowPane = new FlowGraphPane(this, this.graphPaneEl);
+    } else {
+      this.flowPane.refresh({ keepSelection: true });
+    }
   }
   getThemeColors() {
     const styles = getComputedStyle(document.body);
@@ -7922,7 +7991,29 @@ var TerminalView = class extends import_obsidian.ItemView {
     const additionalFlags = flagsByProvider[backendKey] || null;
     if (additionalFlags) cliCmd += " " + additionalFlags;
     let baseCmd = cliCmd;
-    if (continueSession && backend.resumeFlag) {
+    // --- session continuity across Obsidian restarts ------------------------
+    // Claude Code lets a session claim its own id (--session-id <uuid>) and be
+    // pointed back at that exact id later (--resume <uuid>). Every fresh start
+    // of this view claims a new id, which getState() writes into the workspace
+    // layout; a start that follows an Obsidian restart resumes that id. This is
+    // exact where --continue is not: --continue takes the most recently touched
+    // conversation in the cwd, which with several sessions running against one
+    // vault is often a different one.
+    const claudeIds = backendKey === "claude";
+    // Resume when this view arrived carrying a persisted id and has not yet
+    // started a shell. That is exactly the workspace-restore case, and it holds
+    // whether the restore happens at launch or when a collapsed sidebar is
+    // reopened later; every start after the first claims a new id.
+    const resumeOwn = !!(claudeIds && this.sessionId && !this._shellStarted);
+    this._shellStarted = true;
+    if (resumeOwn) {
+      cliCmd += " --resume " + this.sessionId;
+    } else if (claudeIds && !continueSession) {
+      this.sessionId = newSessionId();
+      cliCmd += " --session-id " + this.sessionId;
+      this.app.workspace.requestSaveLayout?.();
+    }
+    if (!resumeOwn && continueSession && backend.resumeFlag) {
       if (backend.resumeIsSubcommand) {
         // e.g. "codex resume --last" — replace the whole command
         cliCmd = backend.binary + " " + backend.resumeFlag;
@@ -7931,6 +8022,17 @@ var TerminalView = class extends import_obsidian.ItemView {
         cliCmd += " " + backend.resumeFlag;
       }
     }
+    // Whenever a session flag was added, keep a fallback behind it: resuming a
+    // named id can fail (transcript pruned, or the workspace layout arrived
+    // from the other machine over OneDrive), so try --continue next and a plain
+    // start last. When no flag was added the chain collapses to the bare
+    // command, as it was before.
+    const attempts = [cliCmd];
+    if (resumeOwn && backend.resumeFlag && !backend.resumeIsSubcommand) {
+      attempts.push(baseCmd + " " + backend.resumeFlag);
+    }
+    if (!attempts.includes(baseCmd)) attempts.push(baseCmd);
+    const cliChain = attempts.join(" || ");
 
     // Get PATH from user's login shell (GUI apps don't inherit shell config)
     let shellEnv = { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" };
@@ -7958,7 +8060,7 @@ var TerminalView = class extends import_obsidian.ItemView {
         }
       } catch (e) {
         // Fall back to process.env.PATH if shell init fails
-        console.warn('[Claude Sidebar] PATH detection timed out — falling back to system PATH. If tools are missing, check your shell startup time.');
+        console.warn('[Flow Terminal] PATH detection timed out — falling back to system PATH. If tools are missing, check your shell startup time.');
       }
     } else {
       try {
@@ -7969,7 +8071,7 @@ var TerminalView = class extends import_obsidian.ItemView {
         const freshPath = psOut.trim();
         if (freshPath) shellEnv.PATH = freshPath;
       } catch (e) {
-        console.warn("[Claude Sidebar] Windows PATH refresh failed — falling back to process PATH.");
+        console.warn("[Flow Terminal] Windows PATH refresh failed — falling back to process PATH.");
       }
     }
     // Ensure backend-specific paths are available
@@ -8003,9 +8105,7 @@ var TerminalView = class extends import_obsidian.ItemView {
     }
     const shellCmd = !cliFound
       ? `exec $SHELL -i`
-      : continueSession
-        ? `${cliCmd} || ${baseCmd} || true; exec $SHELL -i`
-        : `${cliCmd} || true; exec $SHELL -i`;
+      : `${cliChain} || true; exec $SHELL -i`;
     let args = isWindows
       ? [ptyPath, String(cols), String(rows), shell]
       : [ptyPath, String(cols), String(rows), shell, "-lc", shellCmd];
@@ -8088,10 +8188,12 @@ var TerminalView = class extends import_obsidian.ItemView {
     if (isWindows && cliFound) {
       setTimeout(() => {
         if (this.proc && !this.proc.killed) {
-          let winCmd = backend.binary;
-          if (yoloMode && backend.yoloFlag) winCmd += ' ' + backend.yoloFlag;
-          if (additionalFlags) winCmd += ' ' + additionalFlags;
-          this.proc.stdin?.write(winCmd + '\r');
+          // Type the same command the POSIX path execs, so the session flags
+          // (--session-id, --resume, --continue) reach the CLI on Windows too.
+          // This branch used to rebuild the command from scratch and drop them,
+          // which is why "Resume last conversation" never worked here. cmd.exe
+          // '||' gives the same fallback chain the POSIX path has.
+          this.proc.stdin?.write(cliChain + '\r');
         }
       }, 1000);
     }
@@ -8131,6 +8233,9 @@ var TerminalView = class extends import_obsidian.ItemView {
     this._isDisposed = true;
     // Kill the PTY FIRST, before any cleanup that could throw and skip it.
     try { this.stopShell(); } catch (_) {}
+    // Stops the _flow/ watch and drops the parsed document.
+    try { this.flowPane?.destroy(); } catch (_) {}
+    this.flowPane = null;
     this.plugin?._trackedTerminalViews?.delete(this);
     this.resizeObserver?.disconnect();
     this.themeObserver?.disconnect();
@@ -8220,7 +8325,7 @@ var CliProviderSwitchModal = class extends import_obsidian.SuggestModal {
   renderSuggestion(item, el) {
     const suffix = item.isCurrent ? (this.mode === "once" ? "  (default)" : "  (current)") : "";
     el.createEl("div", { text: item.backend.label + suffix });
-    el.createEl("small", { text: item.backend.binary, cls: "vault-terminal-suggest-binary" });
+    el.createEl("small", { text: item.backend.binary, cls: "flow-terminal-suggest-binary" });
   }
   async onChooseSuggestion(item) {
     if (this.mode === "once") {
@@ -8323,7 +8428,7 @@ var ClaudeSidebarSettingsTab = class extends import_obsidian.PluginSettingTab {
         text.inputEl.rows = 2;
         setTimeout(grow, 0);
       });
-    envSetting.settingEl.addClass("claude-sidebar-env-setting");
+    envSetting.settingEl.addClass("flow-terminal-env-setting");
     new import_obsidian.Setting(containerEl)
       .setName("Terminal font size")
       .setDesc("Size of the terminal text in pixels (6–32). Default is 13. Applies to open tabs immediately.")
@@ -8345,6 +8450,26 @@ var ClaudeSidebarSettingsTab = class extends import_obsidian.PluginSettingTab {
             this.plugin.applyFontSizeToOpenTerminals(n);
           });
       });
+
+    // --- the run graph ---------------------------------------------------
+    // Deliberately settings-free. There is no path field and no profile
+    // selector here, and their absence is the requirement rather than a
+    // default that has not been filled in yet (task 6.4).
+    //
+    // A settings file inside the vault syncs between machines over OneDrive,
+    // so an absolute path held in one is correct on at most one of them. The
+    // run-graph directory is therefore derived from the vault Obsidian
+    // currently has open, every time it is read, and never stored.
+    new import_obsidian.Setting(containerEl).setName("Run graph").setHeading();
+    new import_obsidian.Setting(containerEl)
+      .setName("Where the run graph is read from")
+      .setDesc(
+        "This vault's " + FLOW_RESERVED_DIRNAME + "/ directory, resolved at runtime. " +
+        "There is no path setting and no profile selector: a stored absolute path " +
+        "would be wrong on the other machine this vault syncs to, and widening the " +
+        "view to another profile is not something a setting is allowed to do. " +
+        "The view is read-only and writes no file into the vault."
+      );
   }
 };
 var VaultTerminalPlugin = class extends import_obsidian.Plugin {
@@ -8420,11 +8545,17 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
         }
       })
     );
-    const ribbonIcon = this.addRibbonIcon("bot", `New ${this.getDefaultBackend().label} Tab`, () => {
+    // A distinct icon and a distinct name from the original's "bot" /
+    // "New <provider> Tab", so that with both plugins enabled the ribbon entry
+    // being clicked is not a guess (task 8.1). Activating it again reveals the
+    // view that is already open rather than opening a second one (task 1.3);
+    // "New agent tab" is still on the right-click menu and the command palette
+    // for a reader who does want a second terminal.
+    const ribbonIcon = this.addRibbonIcon("network", "Flow: terminal and run graph", () => {
       const now = Date.now();
       if (now - this.lastRibbonClick < 1500) return; // 1.5s throttle to prevent accidental double-clicks
       this.lastRibbonClick = now;
-      this.createNewTab();
+      this.activateView();
     });
     this.ribbonIcon = ribbonIcon;
     // Right-click context menu
@@ -8477,27 +8608,27 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
       menu.showAtMouseEvent(e);
     });
     this.addCommand({
-      id: "open-claude",
+      id: "flow-open-view",
       name: "Open terminal",
       callback: () => this.activateView()
     });
     this.addCommand({
-      id: "switch-cli-provider",
+      id: "flow-switch-cli-provider",
       name: "Switch default CLI provider…",
       callback: () => new CliProviderSwitchModal(this.app, this, "default").open()
     });
     this.addCommand({
-      id: "new-tab-with-cli-provider",
+      id: "flow-new-tab-with-cli-provider",
       name: "New agent tab (other CLI)…",
       callback: () => new CliProviderSwitchModal(this.app, this, "once").open()
     });
     this.addCommand({
-      id: "new-claude-tab",
+      id: "flow-new-tab",
       name: "New agent tab",
       callback: () => this.createNewTab()
     });
     this.addCommand({
-      id: "new-claude-tab-yolo",
+      id: "flow-new-tab-yolo",
       name: "New agent tab (YOLO mode)",
       checkCallback: (checking) => {
         const backend = this.getDefaultBackend();
@@ -8507,7 +8638,7 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
       }
     });
     this.addCommand({
-      id: "close-claude-tab",
+      id: "flow-close-tab",
       name: "Close agent tab",
       checkCallback: (checking) => {
         const view = this.app.workspace.getActiveViewOfType(TerminalView);
@@ -8519,12 +8650,12 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
       }
     });
     this.addCommand({
-      id: "toggle-claude-focus",
+      id: "flow-toggle-focus",
       name: "Toggle Focus: Editor ↔ Agent",
       callback: () => this.toggleFocus()
     });
     this.addCommand({
-      id: "send-file-to-claude",
+      id: "flow-send-file",
       name: "Send file path to agent",
       checkCallback: (checking) => {
         const file = this.app.workspace.getActiveFile();
@@ -8538,7 +8669,7 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
       }
     });
     this.addCommand({
-      id: "send-selection-to-claude",
+      id: "flow-send-selection",
       name: "Send selection to agent",
       checkCallback: (checking) => {
         const editor = this.app.workspace.activeEditor?.editor;
@@ -8556,7 +8687,7 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
     });
 
     this.addCommand({
-      id: "run-claude-from-folder",
+      id: "flow-run-from-folder",
       name: "Run agent from this folder",
       callback: () => {
         const file = this.app.workspace.getActiveFile();
@@ -8570,7 +8701,7 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
       }
     });
     this.addCommand({
-      id: "resume-claude",
+      id: "flow-resume",
       name: "Resume last conversation",
       checkCallback: (checking) => {
         const backend = this.getDefaultBackend();
@@ -8728,7 +8859,10 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
   // provider. Command names can't — they're registered once at load — so those
   // stay provider-neutral rather than re-registering on every settings change.
   refreshRibbonTooltip() {
-    this.ribbonIcon?.setAttribute("aria-label", `New ${this.getDefaultBackend().label} Tab`);
+    // Names the fork, not the provider: the entry opens one view that hosts
+    // whichever provider is configured, and it has to stay distinguishable
+    // from the original plugin's entry.
+    this.ribbonIcon?.setAttribute("aria-label", "Flow: terminal and run graph");
   }
   async createNewTab(workingDir = null, yoloMode = false, continueSession = false, backendKey = null) {
     if (!this.layoutReady) return;
@@ -8826,3 +8960,1039 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
     return true;
   }
 };
+
+// ===========================================================================
+// proj-flow run-graph view — BEGIN (fork addition; no upstream code below)
+//
+// A strictly read-only renderer over the published run-graph contract,
+// `proj-flow/docs/graph-schema.md` (schema_version 2). Everything drawn here
+// is a field the document states.
+//
+// Three rules govern this region and are the reason it is short:
+//
+//   * It parses no session transcripts. Node construction, fan-out grouping
+//     and model classification live in the extractor's Python and stay there;
+//     a second implementation in JavaScript is the drift this whole split
+//     exists to prevent.
+//   * It re-derives no classification. `model_source`, `model_inheriting`,
+//     `concurrency_basis`, `outcome` and the rest are read, never computed.
+//     Absent stays absent: an unrecorded field is reported as unrecorded and
+//     never defaulted, because a defaulted value is indistinguishable from a
+//     recorded one once it is on screen.
+//   * It writes no file. The pane reads `_flow/` and the vault gains nothing
+//     from a run merely being looked at. There is no write path in this
+//     region at all — not a note, not a cache, not a temp file.
+//
+// Deliberately NOT here, and tracked as their own tasks in
+// `openspec/changes/obsidian-flow-plugin/tasks.md`:
+//   * tasks 3.3 / 6.3 — the schema-version and document-kind guard, and the
+//     personal-profile boundary refusal. The loader below records
+//     `schema_version`, `kind` and `profile` on every entry and surfaces them
+//     in the header, so the guard has one place to attach; it does not yet
+//     refuse. Until it lands, this pane only ever opens files whose name ends
+//     `.graph.json`, which the contract gives a distinct suffix precisely so a
+//     glob cannot confuse a plan, a join or a trigger inventory with a run.
+//   * tasks 6.1 / 6.2 — the per-session model-inheriting count and the node
+//     highlight.
+// ===========================================================================
+
+var FLOW_RESERVED_DIRNAME = "_flow";
+var FLOW_GRAPH_SUFFIX = ".graph.json";
+
+// Layout constants. Deliberately the same shape as the canvas writer's
+// (`flow/canvas_core.py`), scaled down for a docked pane: the two renderers
+// consume one contract and a reader moving between them should not have to
+// relearn where things are.
+var FLOW_NODE_W = 176;
+var FLOW_NODE_H = 48;
+var FLOW_COL_GAP = 48;
+var FLOW_ROW_GAP = 14;
+var FLOW_BAND_GAP = 34;
+var FLOW_COLUMN = FLOW_NODE_W + FLOW_COL_GAP;
+var FLOW_ROW = FLOW_NODE_H + FLOW_ROW_GAP;
+
+// A fan-out wraps into a further column past this many members. The widest
+// fan-out measured in the live store is 21, which at 12 becomes two columns
+// of 12 and 9 — roughly screen-shaped. A single 21-row column would be three
+// times taller than wide, which is the strip-shaped drawing `canvas_core`'s
+// own MAX_ROWS comment records as unreadable at fit-zoom.
+var FLOW_MAX_ROWS = 12;
+
+// Turns stack downwards to this height, then the next group of turns packs to
+// the right instead. Same reasoning and same purpose as canvas_core's
+// MAX_BAND_RUN, at this pane's row height.
+var FLOW_MAX_BAND_RUN = 900;
+
+// The contract's closed edge vocabulary. A relation outside it is drawn
+// faintly and named in the header rather than silently omitted: the contract
+// warns that a document carrying an unknown relation "renders partially
+// instead of refusing", so the pane says out loud when that happened.
+var FLOW_KNOWN_RELATIONS = {
+  dispatched: 1,
+  fanout_member: 1,
+  fanout_join: 1,
+  workflow_started: 1,
+  workflow_agent: 1,
+  overlaps: 1,
+  launched: 1,
+  forked: 1,
+  messaged: 1
+};
+
+// How much of a payload the pane renders before it asks. The extractor already
+// excerpts at 4,000 characters; this is the pane's own, smaller bound so that
+// selecting a node does not dump four screens of prompt into the sidebar.
+var FLOW_PAYLOAD_BOUND = 1200;
+
+// Filesystem events arrive several per write on Windows and OneDrive replays
+// them again on sync. Coalesce into one re-render.
+var FLOW_WATCH_DEBOUNCE_MS = 300;
+
+function flowGraphRoot(app) {
+  const base = app.vault.adapter.basePath || "";
+  if (!base) return null;
+  return path.join(base, FLOW_RESERVED_DIRNAME);
+}
+
+// Every `.graph.json` under `_flow/<project>/`, newest first. Statted rather
+// than read: the list is cheap and the parse is not.
+function flowListDocumentFiles(root) {
+  const found = [];
+  let projects;
+  try {
+    projects = fs.readdirSync(root, { withFileTypes: true });
+  } catch (err) {
+    return { found, error: err };
+  }
+  for (const entry of projects) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(root, entry.name);
+    let files;
+    try {
+      files = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (err) {
+      continue;
+    }
+    for (const file of files) {
+      if (!file.isFile() || !file.name.endsWith(FLOW_GRAPH_SUFFIX)) continue;
+      const full = path.join(dir, file.name);
+      let stat = null;
+      try {
+        stat = fs.statSync(full);
+      } catch (err) {
+        continue;
+      }
+      found.push({
+        file: full,
+        project: entry.name,
+        sessionId: file.name.slice(0, -FLOW_GRAPH_SUFFIX.length),
+        mtimeMs: stat.mtimeMs,
+        size: stat.size
+      });
+    }
+  }
+  found.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return { found, error: null };
+}
+
+function flowReadDocument(file) {
+  try {
+    const text = fs.readFileSync(file, "utf8");
+    return { document: JSON.parse(text), error: null };
+  } catch (err) {
+    return { document: null, error: err };
+  }
+}
+
+// The few document-level facts the session list needs. Kept separate from the
+// document itself so the pane holds one parsed graph at a time rather than
+// forty.
+function flowSummarise(entry, document) {
+  const counts = (document && document.counts) || {};
+  return {
+    file: entry.file,
+    project: entry.project,
+    sessionId: entry.sessionId,
+    mtimeMs: entry.mtimeMs,
+    schemaVersion: document ? document.schema_version : null,
+    documentKind: document ? document.kind : null,
+    profile: document ? document.profile : null,
+    dispatches: counts["kind:dispatch"] || 0,
+    nodes: counts.nodes || 0,
+    widestFanout: counts.widest_fanout || 0,
+    modelInheriting: counts.model_inheriting || 0
+  };
+}
+
+function flowNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function flowChildren(document) {
+  const children = new Map();
+  for (const node of document.nodes || []) {
+    const parent = node["graph.node.parent_id"] || null;
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(node);
+  }
+  for (const group of children.values()) {
+    group.sort((a, b) => {
+      const delta = flowNumber(a.ordinal) - flowNumber(b.ordinal);
+      if (delta !== 0) return delta;
+      return String(a["graph.node.id"]).localeCompare(String(b["graph.node.id"]));
+    });
+  }
+  return children;
+}
+
+// Position every node. A pure function of the document: no clock, no
+// randomness, so two renders of unchanged input place things identically and a
+// re-render after a file change does not shuffle the drawing under the reader.
+//
+// Every node lands on a column, and every column keeps a floor — the y a box
+// placed in it must not start above. That one rule is what makes the drawing
+// provably non-overlapping rather than non-overlapping on the documents that
+// happen to be on disk: a fan-out that wraps into a second column, a nested
+// dispatch hanging off a member near the bottom of a tall stack, and a band
+// that runs longer than the one before it are all cases where a height
+// *estimated* from a row count is short, and a short estimate is exactly how
+// two boxes end up on the same pixels.
+function flowLayout(document) {
+  const children = flowChildren(document);
+  const positions = new Map();
+  // column index -> the first y in that column that is still free.
+  const floors = new Map();
+  const nodes = document.nodes || [];
+  const session = nodes.find((n) => n.kind === "session") || null;
+  let widestColumn = 0;
+
+  function floorOf(column) {
+    return floors.has(column) ? floors.get(column) : 0;
+  }
+
+  function occupy(column, top) {
+    if (column > widestColumn) widestColumn = column;
+    const bottom = top + FLOW_ROW;
+    if (bottom > floorOf(column)) floors.set(column, bottom);
+  }
+
+  function put(node, column, top) {
+    positions.set(node["graph.node.id"], { x: column * FLOW_COLUMN, y: top });
+    occupy(column, top);
+    return top;
+  }
+
+  // Stack `members` downwards from `desiredTop`, wrapping into a further column
+  // every FLOW_MAX_ROWS. The whole stack is pushed down past the floor of every
+  // column it will touch, so it never lands on something already drawn.
+  function stack(members, column, desiredTop) {
+    const used = Math.max(1, Math.ceil(members.length / FLOW_MAX_ROWS));
+    let top = desiredTop;
+    for (let c = 0; c < used; c++) top = Math.max(top, floorOf(column + c));
+    let bottom = top;
+    for (let index = 0; index < members.length; index++) {
+      const c = column + Math.floor(index / FLOW_MAX_ROWS);
+      const y = top + (index % FLOW_MAX_ROWS) * FLOW_ROW;
+      put(members[index], c, y);
+      if (y + FLOW_ROW > bottom) bottom = y + FLOW_ROW;
+    }
+    const rows = Math.min(members.length, FLOW_MAX_ROWS);
+    return { rows, used, top, bottom };
+  }
+
+  // One orchestrator (or workflow run) with its members and their join: the
+  // repeating unit of a run graph, drawn left to right.
+  function band(node, column, desiredTop) {
+    const kids = children.get(node["graph.node.id"]) || [];
+    const joins = kids.filter((k) => k.kind === "join");
+    const members = kids.filter((k) => k.kind !== "join");
+    if (!members.length) {
+      const top = put(node, column, Math.max(desiredTop, floorOf(column)));
+      return { bottom: top + FLOW_ROW, width: 1 };
+    }
+    const stacked = stack(members, column + 1, desiredTop);
+    // The parent sits level with the middle of the first column of members.
+    const middle = stacked.top + Math.floor(((stacked.rows - 1) * FLOW_ROW) / 2);
+    const parentTop = put(node, column, Math.max(middle, floorOf(column)));
+    let bottom = Math.max(stacked.bottom, parentTop + FLOW_ROW);
+    let width = 1 + stacked.used;
+    for (const join of joins) {
+      const joinTop = put(join, column + width, Math.max(middle, floorOf(column + width)));
+      bottom = Math.max(bottom, joinTop + FLOW_ROW);
+    }
+    if (joins.length) width += 1;
+    // A dispatch that dispatched again. Rare in the store today and drawn
+    // anyway, because the contract permits it and a renderer that only works
+    // on the documents it was tested against is not a renderer of a contract.
+    let nested = 0;
+    for (const member of members) {
+      const grandchildren = children.get(member["graph.node.id"]) || [];
+      if (!grandchildren.length) continue;
+      const sub = stack(grandchildren, column + width, positions.get(member["graph.node.id"]).y);
+      nested = Math.max(nested, sub.used);
+      bottom = Math.max(bottom, sub.bottom);
+    }
+    return { bottom, width: width + nested };
+  }
+
+  if (session) {
+    const topLevel = children.get(session["graph.node.id"]) || [];
+    let base = 1;
+    let run = 0;
+    let groupWidth = 1;
+    for (const node of topLevel) {
+      // Turns stack downwards until the drawing is taller than it is useful,
+      // then the next group of turns packs to the right of the widest band so
+      // far — never into it, which is what `groupWidth` is counting.
+      if (run > FLOW_MAX_BAND_RUN) {
+        base += groupWidth;
+        run = 0;
+        groupWidth = 1;
+      }
+      const placed = band(node, base, run);
+      groupWidth = Math.max(groupWidth, placed.width);
+      run = placed.bottom + FLOW_BAND_GAP;
+    }
+    put(session, 0, 0);
+  }
+
+  // Anything the walk did not reach — a node whose recorded parent is not in
+  // this document. Placed in a column of its own past everything else rather
+  // than dropped, because a node the document states is a node the drawing
+  // owes the reader.
+  const orphanColumn = widestColumn + 1;
+  for (const node of nodes) {
+    if (positions.has(node["graph.node.id"])) continue;
+    put(node, orphanColumn, floorOf(orphanColumn));
+  }
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const point of positions.values()) {
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x + FLOW_NODE_W);
+    maxY = Math.max(maxY, point.y + FLOW_NODE_H);
+  }
+  if (!positions.size) {
+    minX = 0; minY = 0; maxX = FLOW_NODE_W; maxY = FLOW_NODE_H;
+  }
+  for (const [id, point] of positions) {
+    positions.set(id, { x: point.x - minX, y: point.y - minY });
+  }
+  return { positions, width: maxX - minX, height: maxY - minY };
+}
+
+function flowSvg(tag, attrs) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const key of Object.keys(attrs || {})) {
+    if (attrs[key] === null || attrs[key] === undefined) continue;
+    el.setAttribute(key, String(attrs[key]));
+  }
+  return el;
+}
+
+function flowClip(text, limit) {
+  const flat = String(text === null || text === undefined ? "" : text).replace(/\s+/g, " ").trim();
+  if (flat.length <= limit) return flat;
+  return flat.slice(0, Math.max(0, limit - 1)) + "…";
+}
+
+function flowFace(node) {
+  return node.summary || node["graph.node.name"] || node["graph.node.id"] || "?";
+}
+
+// The second line of a node face: what it is, how it ended, and what ran it.
+// Every part is a stated field; nothing is filled in when the document is
+// silent.
+function flowSubFace(node) {
+  const parts = [String(node.kind || "?").replace(/_/g, " ")];
+  if (node.outcome) parts.push(node.outcome);
+  if (node.model) parts.push(node.model);
+  else if (node.agent_type) parts.push(node.agent_type);
+  return parts.join(" · ");
+}
+
+function flowNodeClass(node) {
+  const kind = node.kind || "";
+  if (kind === "session") return "flow-node-session";
+  if (kind === "orchestrator" || kind === "join") return "flow-node-structure";
+  if (kind === "workflow_run" || kind === "workflow_agent") return "flow-node-workflow";
+  if (node.outcome === "errored") return "flow-node-errored";
+  return "flow-node-dispatch";
+}
+
+function flowStamp(value) {
+  const text = String(value || "");
+  if (text.length >= 19) return text.slice(0, 19).replace("T", " ") + " UTC";
+  return text;
+}
+
+// Elapsed is arithmetic over two recorded timestamps and is labelled as such,
+// so that it is never mistaken for a duration the transcript stated.
+function flowElapsed(node) {
+  if (!node.timestamp || !node.ended_at) return null;
+  const start = Date.parse(node.timestamp);
+  const end = Date.parse(node.ended_at);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+  const seconds = (end - start) / 1000;
+  if (seconds < 90) return seconds.toFixed(1) + " s";
+  return (seconds / 60).toFixed(1) + " min";
+}
+
+// ---------------------------------------------------------------------------
+// The pane
+// ---------------------------------------------------------------------------
+
+var FlowGraphPane = class {
+  constructor(view, hostEl) {
+    this.view = view;
+    this.app = view.app;
+    this.hostEl = hostEl;
+    this.root = flowGraphRoot(view.app);
+    this.summaries = [];
+    this.summaryCache = new Map();
+    this.selectedFile = null;
+    this.document = null;
+    this.documentError = null;
+    this.selectedNodeId = null;
+    this.expandedPayloads = new Set();
+    this.scale = 1;
+    this.tx = 0;
+    this.ty = 0;
+    this.watcher = null;
+    this.watchAvailable = false;
+    this.watchTimer = null;
+    this.destroyed = false;
+    this.build();
+  }
+
+  build() {
+    const host = this.hostEl;
+    host.empty();
+    host.addClass("flow-graph-pane");
+
+    const bar = host.createDiv({ cls: "flow-graph-bar" });
+    this.sessionSelect = bar.createEl("select", { cls: "flow-session-select dropdown" });
+    this.sessionSelect.addEventListener("change", () => {
+      this.select(this.sessionSelect.value, { keepSelection: false });
+    });
+    const refresh = bar.createEl("button", { cls: "flow-icon-button", text: "Refresh" });
+    refresh.setAttribute("aria-label", "Re-read the run-graph documents from disk");
+    refresh.addEventListener("click", () => this.refresh({ keepSelection: true }));
+
+    const zoom = bar.createDiv({ cls: "flow-zoom-controls" });
+    const mkZoom = (label, title, fn) => {
+      const b = zoom.createEl("button", { cls: "flow-icon-button", text: label });
+      b.setAttribute("aria-label", title);
+      b.addEventListener("click", fn);
+      return b;
+    };
+    mkZoom("−", "Zoom out", () => this.zoomBy(1 / 1.2));
+    mkZoom("+", "Zoom in", () => this.zoomBy(1.2));
+    mkZoom("Fit", "Fit the whole graph in the pane", () => this.fit());
+    mkZoom("1:1", "Reset to actual size", () => this.resetZoom());
+
+    this.statusEl = host.createDiv({ cls: "flow-graph-status" });
+    this.canvasEl = host.createDiv({ cls: "flow-graph-canvas" });
+    this.detailEl = host.createDiv({ cls: "flow-detail-pane" });
+
+    this.attachPanZoom();
+    // Watch first, then render. The status line reports whether live refresh is
+    // available, and rendering before the watch is attempted would print
+    // "unavailable" on the first draw of every session that in fact has one.
+    this.startWatching();
+    this.refresh({ keepSelection: false });
+  }
+
+  // -- loading ------------------------------------------------------------
+
+  refresh(options) {
+    const keepSelection = !!(options && options.keepSelection);
+    if (!this.root) {
+      this.summaries = [];
+      this.renderEmpty("This vault has no filesystem path (the plugin is desktop-only).");
+      return;
+    }
+    const listing = flowListDocumentFiles(this.root);
+    if (listing.error && listing.error.code === "ENOENT") {
+      this.summaries = [];
+      this.renderEmpty(null);
+      return;
+    }
+    if (listing.error) {
+      this.summaries = [];
+      this.renderEmpty("Could not read " + this.root + ": " + listing.error.message);
+      return;
+    }
+    const summaries = [];
+    for (const entry of listing.found) {
+      const cached = this.summaryCache.get(entry.file);
+      if (cached && cached.mtimeMs === entry.mtimeMs) {
+        summaries.push(cached);
+        continue;
+      }
+      const read = flowReadDocument(entry.file);
+      const summary = flowSummarise(entry, read.document);
+      summary.unreadable = read.error ? read.error.message : null;
+      this.summaryCache.set(entry.file, summary);
+      summaries.push(summary);
+    }
+    this.summaries = summaries;
+    if (!summaries.length) {
+      this.renderEmpty(null);
+      return;
+    }
+    const wanted = keepSelection && this.selectedFile
+      && summaries.some((s) => s.file === this.selectedFile)
+      ? this.selectedFile
+      : summaries[0].file;
+    this.select(wanted, { keepSelection });
+  }
+
+  select(file, options) {
+    const keepSelection = !!(options && options.keepSelection);
+    this.selectedFile = file;
+    const read = flowReadDocument(file);
+    this.document = read.document;
+    this.documentError = read.error ? read.error.message : null;
+    if (!keepSelection) {
+      this.selectedNodeId = null;
+      this.expandedPayloads.clear();
+    }
+    this.renderSessionList();
+    this.renderStatus();
+    this.renderGraph({ keepSelection });
+  }
+
+  // -- rendering ----------------------------------------------------------
+
+  renderEmpty(problem) {
+    this.summaryCache.clear();
+    this.document = null;
+    this.selectedFile = null;
+    this.sessionSelect.empty();
+    this.canvasEl.empty();
+    this.detailEl.empty();
+    this.statusEl.empty();
+    const box = this.canvasEl.createDiv({ cls: "flow-empty" });
+    if (problem) {
+      box.createEl("p", { cls: "flow-empty-problem", text: problem });
+    }
+    box.createEl("h3", { text: "No run-graph document yet" });
+    box.createEl("p", {
+      text:
+        "This view renders documents the extractor writes to " +
+        FLOW_RESERVED_DIRNAME +
+        "/<project>/<session-id>" +
+        FLOW_GRAPH_SUFFIX +
+        " inside this vault. It parses no transcripts of its own, so there is nothing to draw until one is generated."
+    });
+    box.createEl("p", { text: "Generate them from the proj-flow repository:" });
+    box.createEl("pre", { cls: "flow-empty-command", text: "python -m flow render" });
+    box.createEl("p", {
+      cls: "flow-empty-note",
+      text:
+        "Everything under " +
+        FLOW_RESERVED_DIRNAME +
+        "/ is disposable generated state: deleting it costs nothing and one command regenerates it."
+    });
+  }
+
+  renderSessionList() {
+    const select = this.sessionSelect;
+    select.empty();
+    for (const summary of this.summaries) {
+      const option = select.createEl("option", { value: summary.file });
+      const label =
+        summary.sessionId.slice(0, 8) +
+        " · " +
+        summary.dispatches +
+        " dispatches" +
+        (summary.widestFanout ? " · fan-out " + summary.widestFanout : "") +
+        (summary.unreadable ? " · unreadable" : "");
+      option.textContent = label;
+      option.title = summary.project + " / " + summary.sessionId;
+      if (summary.file === this.selectedFile) option.selected = true;
+    }
+  }
+
+  renderStatus() {
+    const status = this.statusEl;
+    status.empty();
+    if (this.documentError) {
+      status.createSpan({ cls: "flow-status-problem", text: "Could not read this document: " + this.documentError });
+      return;
+    }
+    const doc = this.document;
+    if (!doc) return;
+    const counts = doc.counts || {};
+    const facts = [
+      "schema " + (doc.schema_version === undefined ? "unrecorded" : doc.schema_version),
+      "kind " + (doc.kind || "unrecorded"),
+      (counts.nodes || 0) + " nodes",
+      (counts["kind:dispatch"] || 0) + " dispatches",
+      (counts["kind:orchestrator"] || 0) + " turns",
+      "widest fan-out " + (counts.widest_fanout || 0)
+    ];
+    if (counts["outcome:unresolved"]) facts.push(counts["outcome:unresolved"] + " unresolved");
+    if (counts["outcome:errored"]) facts.push(counts["outcome:errored"] + " errored");
+    status.createSpan({ cls: "flow-status-facts", text: facts.join(" · ") });
+
+    const skipped = doc.skipped_lines && doc.skipped_lines.total;
+    if (skipped) {
+      status.createSpan({
+        cls: "flow-status-note",
+        text: skipped + " transcript line(s) were skipped when this document was written."
+      });
+    }
+    const unknown = this.unknownRelations();
+    if (unknown.length) {
+      status.createSpan({
+        cls: "flow-status-problem",
+        text:
+          "This document carries edge relation(s) this view does not know: " +
+          unknown.join(", ") +
+          ". They are drawn faintly; the drawing is partial."
+      });
+    }
+    if (!this.watchAvailable) {
+      status.createSpan({
+        cls: "flow-status-note",
+        text: "Live refresh is unavailable here — use Refresh."
+      });
+    }
+  }
+
+  unknownRelations() {
+    const doc = this.document;
+    if (!doc) return [];
+    const seen = new Set();
+    for (const edge of doc.edges || []) {
+      const relation = edge.relation;
+      if (relation && !FLOW_KNOWN_RELATIONS[relation]) seen.add(relation);
+    }
+    return Array.from(seen).sort();
+  }
+
+  renderGraph(options) {
+    const keepSelection = !!(options && options.keepSelection);
+    const canvas = this.canvasEl;
+    canvas.empty();
+    const doc = this.document;
+    if (!doc || !Array.isArray(doc.nodes)) {
+      canvas.createDiv({ cls: "flow-empty", text: "This file holds no nodes." });
+      this.renderDetail(null);
+      return;
+    }
+    const laid = flowLayout(doc);
+    this.layout = laid;
+    this.byId = new Map((doc.nodes || []).map((n) => [n["graph.node.id"], n]));
+
+    const svg = flowSvg("svg", { class: "flow-graph-svg", width: "100%", height: "100%" });
+    const scene = flowSvg("g", { class: "flow-scene" });
+    svg.appendChild(scene);
+    canvas.appendChild(svg);
+    this.svgEl = svg;
+    this.sceneEl = scene;
+
+    const edgeLayer = flowSvg("g", { class: "flow-edges" });
+    const nodeLayer = flowSvg("g", { class: "flow-nodes" });
+    scene.appendChild(edgeLayer);
+    scene.appendChild(nodeLayer);
+
+    for (const edge of doc.edges || []) {
+      const from = laid.positions.get(edge.source);
+      const to = laid.positions.get(edge.target);
+      if (!from || !to) continue;
+      const x1 = from.x + FLOW_NODE_W;
+      const y1 = from.y + FLOW_NODE_H / 2;
+      const x2 = to.x;
+      const y2 = to.y + FLOW_NODE_H / 2;
+      const mid = (x1 + x2) / 2;
+      const relation = edge.relation || "";
+      const classes = ["flow-edge", "flow-edge-" + (FLOW_KNOWN_RELATIONS[relation] ? relation : "unknown")];
+      if (edge.inferred) classes.push("flow-edge-inferred");
+      const p = flowSvg("path", {
+        class: classes.join(" "),
+        d: "M " + x1 + " " + y1 + " C " + mid + " " + y1 + ", " + mid + " " + y2 + ", " + x2 + " " + y2
+      });
+      const title = flowSvg("title", {});
+      title.textContent = relation + (edge.inferred ? " (inferred from " + (edge.basis || "a clock") + ")" : "");
+      p.appendChild(title);
+      edgeLayer.appendChild(p);
+    }
+
+    for (const node of doc.nodes) {
+      const id = node["graph.node.id"];
+      const point = laid.positions.get(id);
+      if (!point) continue;
+      const group = flowSvg("g", {
+        class: "flow-node " + flowNodeClass(node) + (id === this.selectedNodeId ? " is-selected" : ""),
+        transform: "translate(" + point.x + "," + point.y + ")",
+        tabindex: "0",
+        role: "button",
+        "data-flow-node-id": id
+      });
+      group.appendChild(
+        flowSvg("rect", { class: "flow-node-box", x: 0, y: 0, rx: 6, ry: 6, width: FLOW_NODE_W, height: FLOW_NODE_H })
+      );
+      const title = flowSvg("text", { class: "flow-node-title", x: 10, y: 20 });
+      title.textContent = flowClip(flowFace(node), 26);
+      group.appendChild(title);
+      const sub = flowSvg("text", { class: "flow-node-sub", x: 10, y: 37 });
+      sub.textContent = flowClip(flowSubFace(node), 30);
+      group.appendChild(sub);
+      const tip = flowSvg("title", {});
+      tip.textContent = flowFace(node) + "\n" + flowSubFace(node);
+      group.appendChild(tip);
+      group.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (this._dragged) return;
+        this.renderDetail(id);
+      });
+      group.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          this.renderDetail(id);
+        }
+      });
+      nodeLayer.appendChild(group);
+    }
+
+    this.applyTransform();
+    if (!keepSelection || !this.selectedNodeId) {
+      this.fit();
+    }
+    // Selection survives a re-render when the node is still in the document,
+    // and is stated as gone when it is not.
+    if (keepSelection && this.selectedNodeId) {
+      if (this.byId.has(this.selectedNodeId)) {
+        this.renderDetail(this.selectedNodeId);
+      } else {
+        const missing = this.selectedNodeId;
+        this.selectedNodeId = null;
+        this.detailEl.empty();
+        this.detailEl.createDiv({
+          cls: "flow-detail-empty",
+          text: "The node that was selected (" + missing + ") is not in the document any more."
+        });
+      }
+    } else {
+      this.renderDetail(this.selectedNodeId);
+    }
+  }
+
+  // -- pan and zoom -------------------------------------------------------
+
+  attachPanZoom() {
+    const canvas = this.canvasEl;
+    canvas.addEventListener("wheel", (event) => {
+      if (!this.sceneEl) return;
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const px = event.clientX - rect.left;
+      const py = event.clientY - rect.top;
+      const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1;
+      this.zoomAt(px, py, factor);
+    }, { passive: false });
+
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+    canvas.addEventListener("pointerdown", (event) => {
+      if (!this.sceneEl) return;
+      dragging = true;
+      this._dragged = false;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (!dragging) return;
+      const dx = event.clientX - lastX;
+      const dy = event.clientY - lastY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) this._dragged = true;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      this.tx += dx;
+      this.ty += dy;
+      this.applyTransform();
+    });
+    const stop = (event) => {
+      if (!dragging) return;
+      dragging = false;
+      try { canvas.releasePointerCapture(event.pointerId); } catch (_) {}
+      window.setTimeout(() => { this._dragged = false; }, 0);
+    };
+    canvas.addEventListener("pointerup", stop);
+    canvas.addEventListener("pointercancel", stop);
+  }
+
+  applyTransform() {
+    if (!this.sceneEl) return;
+    this.sceneEl.setAttribute(
+      "transform",
+      "translate(" + this.tx + "," + this.ty + ") scale(" + this.scale + ")"
+    );
+  }
+
+  zoomAt(px, py, factor) {
+    const next = Math.min(3, Math.max(0.12, this.scale * factor));
+    const ratio = next / this.scale;
+    this.tx = px - (px - this.tx) * ratio;
+    this.ty = py - (py - this.ty) * ratio;
+    this.scale = next;
+    this.applyTransform();
+  }
+
+  zoomBy(factor) {
+    const rect = this.canvasEl.getBoundingClientRect();
+    this.zoomAt(rect.width / 2, rect.height / 2, factor);
+  }
+
+  resetZoom() {
+    this.scale = 1;
+    this.tx = 16;
+    this.ty = 16;
+    this.applyTransform();
+  }
+
+  fit() {
+    if (!this.layout || !this.sceneEl) return;
+    const rect = this.canvasEl.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const pad = 24;
+    const scale = Math.min(
+      (rect.width - pad * 2) / Math.max(1, this.layout.width),
+      (rect.height - pad * 2) / Math.max(1, this.layout.height),
+      1
+    );
+    this.scale = Math.max(0.12, scale);
+    this.tx = pad + Math.max(0, (rect.width - pad * 2 - this.layout.width * this.scale) / 2);
+    this.ty = pad + Math.max(0, (rect.height - pad * 2 - this.layout.height * this.scale) / 2);
+    this.applyTransform();
+  }
+
+  // -- the detail pane ----------------------------------------------------
+
+  renderDetail(nodeId) {
+    this.selectedNodeId = nodeId;
+    const pane = this.detailEl;
+    pane.empty();
+    if (this.sceneEl) {
+      for (const el of Array.from(this.sceneEl.querySelectorAll(".flow-node"))) {
+        el.classList.remove("is-selected");
+      }
+    }
+    if (!nodeId) {
+      pane.createDiv({ cls: "flow-detail-empty", text: "Select a node to read what it was given and what it returned." });
+      return;
+    }
+    const node = this.byId ? this.byId.get(nodeId) : null;
+    if (!node) {
+      pane.createDiv({ cls: "flow-detail-empty", text: "That node is not in this document." });
+      return;
+    }
+    if (this.sceneEl) {
+      const drawn = this.sceneEl.querySelector('.flow-node[data-flow-node-id="' + CSS.escape(nodeId) + '"]');
+      if (drawn) drawn.classList.add("is-selected");
+    }
+
+    pane.createEl("h3", { cls: "flow-detail-title", text: flowFace(node) });
+
+    const rows = pane.createDiv({ cls: "flow-detail-rows" });
+    const row = (label, value) => {
+      if (value === null || value === undefined || value === "") return;
+      const line = rows.createDiv({ cls: "flow-detail-row" });
+      line.createSpan({ cls: "flow-detail-label", text: label });
+      line.createSpan({ cls: "flow-detail-value", text: String(value) });
+    };
+
+    row("node", node["graph.node.id"]);
+    row("kind", node.kind);
+    row("span kind", node["openinference.span.kind"]);
+    row("outcome", node.outcome);
+    if (node.error) row("error", node.error);
+    // These three are stated when present and stated as unrecorded when not,
+    // because their absence is itself the finding this project measures.
+    row("description", node.summary || "not recorded");
+    if (node.summary_source) row("description from", node.summary_source);
+    if (node.kind === "dispatch") {
+      row("agent type", node.agent_type || "not recorded");
+      row("model", node.model || "not recorded");
+      row("model source", node.model_source);
+      if (node.model_inheriting !== undefined) {
+        row("model inheriting", node.model_inheriting ? "yes — it ran on the session model" : "no");
+      }
+    }
+    row("started", flowStamp(node.timestamp));
+    row("ended", node.ended_at ? flowStamp(node.ended_at) : null);
+    const elapsed = flowElapsed(node);
+    if (elapsed) row("elapsed (computed from the two recorded timestamps)", elapsed);
+    row("concurrency", node.concurrency ? node.concurrency + " (" + (node.concurrency_basis || "basis unrecorded") + ")" : null);
+    row("spawn depth", node.spawn_depth);
+    row("agent id", node.agent_id);
+    row("forked", node.is_fork === undefined ? null : node.is_fork ? "yes" : "no");
+    row("background", node.background === undefined ? null : node.background ? "yes" : "no");
+    row("isolation", node.isolation);
+    row("request id", node.request_id);
+    row("tool use id", node.tool_use_id);
+    row("run id", node.run_id);
+    row("script", node.script);
+    row("journal", node.journal);
+    row("journal entries", node.journal_entries);
+    if (node.attachment) {
+      row("attachment", node.attachment + " — " + (node.attachment_reason || "reason not recorded"));
+    }
+    if (node.origin_node_id) {
+      row("launched from", node.origin_node_id + " (" + (node.launch_relation || "relation unrecorded") + ")");
+    }
+    row("plan", node.plan_id);
+
+    if (Array.isArray(node.vault_touches) && node.vault_touches.length) {
+      const touches = pane.createDiv({ cls: "flow-detail-section" });
+      touches.createEl("h4", { text: "vault touches (" + node.vault_touches.length + ")" });
+      const list = touches.createEl("ul", { cls: "flow-touch-list" });
+      for (const touch of node.vault_touches.slice(0, 40)) {
+        list.createEl("li", { text: (touch.operation || "unclassified") + " · " + (touch.path || "?") });
+      }
+      if (node.vault_touches.length > 40) {
+        touches.createEl("p", {
+          cls: "flow-detail-note",
+          text: node.vault_touches.length - 40 + " further touch(es) not listed."
+        });
+      }
+    }
+
+    if (node.interior && node.interior.tool_counts) {
+      const counts = Object.entries(node.interior.tool_counts).sort((a, b) => b[1] - a[1]);
+      row("tools", counts.map((c) => c[0] + "×" + c[1]).join(", "));
+    }
+
+    if (node.kind !== "dispatch") return;
+
+    const payload = node.payload || null;
+    const unresolved = node.outcome === "unresolved";
+
+    this.renderPayload(pane, "prompt", payload ? payload.prompt : null, payload ? payload.prompt_length : null, payload ? payload.prompt_truncated : false, "No prompt text was recorded for this dispatch.");
+
+    if (unresolved) {
+      const box = pane.createDiv({ cls: "flow-detail-section" });
+      box.createEl("h4", { text: "returned" });
+      box.createEl("p", {
+        cls: "flow-detail-unresolved",
+        text:
+          "This dispatch is recorded as unresolved: no result was recorded for it. That is a fact about the transcript, not an empty result — the run may have been cut off, or the record may never have been written."
+      });
+    } else {
+      this.renderPayload(pane, "returned", payload ? payload.returned : null, payload ? payload.returned_length : null, payload ? payload.returned_truncated : false, "No returned text was recorded for this dispatch.");
+    }
+
+    if (payload && payload.source) {
+      pane.createDiv({
+        cls: "flow-detail-note",
+        text: "payload read from " + (payload.source.file || "an unrecorded file")
+      });
+    }
+  }
+
+  // A bounded excerpt with an explicit control to reveal the rest. Nothing is
+  // written anywhere to show it: the text is already in the document the pane
+  // has open.
+  renderPayload(pane, label, text, recordedLength, extractorTruncated, absentMessage) {
+    const box = pane.createDiv({ cls: "flow-detail-section" });
+    box.createEl("h4", { text: label });
+    if (text === null || text === undefined || text === "") {
+      box.createEl("p", { cls: "flow-detail-note", text: absentMessage });
+      return;
+    }
+    const key = this.selectedNodeId + "|" + label;
+    const expanded = this.expandedPayloads.has(key);
+    const full = String(text);
+    const shown = expanded || full.length <= FLOW_PAYLOAD_BOUND ? full : full.slice(0, FLOW_PAYLOAD_BOUND);
+    box.createEl("pre", { cls: "flow-payload", text: shown });
+    const notes = [];
+    if (recordedLength !== null && recordedLength !== undefined) {
+      notes.push("recorded length " + recordedLength + " characters");
+    }
+    if (extractorTruncated) {
+      notes.push("excerpted by the extractor at 4,000 characters");
+    }
+    if (notes.length) {
+      box.createEl("p", { cls: "flow-detail-note", text: notes.join("; ") + "." });
+    }
+    if (full.length > FLOW_PAYLOAD_BOUND) {
+      const button = box.createEl("button", {
+        cls: "flow-reveal-button",
+        text: expanded
+          ? "Show less"
+          : "Show the remaining " + (full.length - FLOW_PAYLOAD_BOUND) + " characters"
+      });
+      button.addEventListener("click", () => {
+        if (expanded) this.expandedPayloads.delete(key);
+        else this.expandedPayloads.add(key);
+        this.renderDetail(this.selectedNodeId);
+      });
+    }
+  }
+
+  // -- watching -----------------------------------------------------------
+
+  // The reserved output directory and nothing else. `_flow/` is local runtime
+  // state: not version-controlled, not synchronised, one writer. That is the
+  // whole reason a renderer-process watch is safe here, and it is why widening
+  // this watch to a synchronised or version-controlled folder is a new risk
+  // rather than a bigger version of this one.
+  startWatching() {
+    if (!this.root) return;
+    try {
+      this.watcher = fs.watch(this.root, { recursive: true }, () => this.onWatchEvent());
+      // A watch that dies mid-session leaves the view silently stale, so the
+      // status line is redrawn to say so and point at Refresh.
+      this.watcher.on("error", () => {
+        this.stopWatching(true);
+        if (!this.destroyed && this.statusEl) this.renderStatus();
+      });
+      this.watchAvailable = true;
+    } catch (err) {
+      this.watcher = null;
+      this.watchAvailable = false;
+    }
+  }
+
+  stopWatching(markUnavailable) {
+    if (this.watcher) {
+      try { this.watcher.close(); } catch (_) {}
+      this.watcher = null;
+    }
+    if (markUnavailable) this.watchAvailable = false;
+    if (this.watchTimer) {
+      window.clearTimeout(this.watchTimer);
+      this.watchTimer = null;
+    }
+  }
+
+  // Coalesced: a render writes several files and OneDrive replays each of them,
+  // so the events arrive in bursts. One re-render per burst.
+  onWatchEvent() {
+    if (this.destroyed) return;
+    if (this.watchTimer) window.clearTimeout(this.watchTimer);
+    this.watchTimer = window.setTimeout(() => {
+      this.watchTimer = null;
+      if (this.destroyed) return;
+      this.refresh({ keepSelection: true });
+    }, FLOW_WATCH_DEBOUNCE_MS);
+  }
+
+  destroy() {
+    this.destroyed = true;
+    this.stopWatching(false);
+    this.summaryCache.clear();
+    this.document = null;
+  }
+};
+// ===== proj-flow run-graph view — END =====

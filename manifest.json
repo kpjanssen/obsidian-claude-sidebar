@@ -1,10 +1,10 @@
 {
-  "id": "claude-sidebar",
-  "name": "Claude Sidebar",
-  "version": "1.9.5",
+  "id": "flow-terminal",
+  "name": "Flow Terminal and Run Graph",
+  "version": "0.1.0",
   "minAppVersion": "1.0.0",
-  "description": "Run Claude Code, Codex, Grok, and other agent CLIs in your sidebar.",
-  "author": "Derek Larson",
-  "authorUrl": "https://github.com/derek-larson14",
+  "description": "An agent CLI terminal in the sidebar, alongside a read-only run graph of what the agents did. A fork of Claude Sidebar by Derek Larson; see UPSTREAM.md.",
+  "author": "Koen Janssen (fork of Claude Sidebar by Derek Larson, MIT)",
+  "authorUrl": "https://github.com/kpjanssen/obsidian-claude-sidebar",
   "isDesktopOnly": true
 }
