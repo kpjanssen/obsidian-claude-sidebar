@@ -215,6 +215,51 @@ function assertNoOverlap(document, label) {
   }
 })();
 
+// --- a plan lays out, and it has no session node ---------------------------
+// The layout used to begin by finding the session node and place nothing when
+// there was none, which meant a plan drew as a column of orphans. The root is
+// now found by structure, so this asserts the structural property rather than
+// the kind: everything is placed, and the root is at the origin.
+(function aPlanLaysOut() {
+  const document = {
+    schema_version: 2,
+    kind: "plan",
+    nodes: [
+      { "graph.node.id": "orchestrator:root", kind: "orchestrator", ordinal: 0 },
+      {
+        "graph.node.id": "orchestrator:turn",
+        "graph.node.parent_id": "orchestrator:root",
+        kind: "orchestrator",
+        ordinal: 0
+      },
+      {
+        "graph.node.id": "dispatch:a",
+        "graph.node.parent_id": "orchestrator:turn",
+        kind: "dispatch",
+        ordinal: 0
+      },
+      {
+        "graph.node.id": "dispatch:b",
+        "graph.node.parent_id": "orchestrator:turn",
+        kind: "dispatch",
+        ordinal: 1
+      },
+      {
+        "graph.node.id": "join:turn",
+        "graph.node.parent_id": "orchestrator:turn",
+        kind: "join",
+        ordinal: 2
+      }
+    ]
+  };
+  const laid = L.flowLayout(document);
+  equal(laid.positions.size, 5, "every node of a plan is placed");
+  const root = laid.positions.get("orchestrator:root");
+  equal(root.x, 0, "the plan's root sits in the leftmost column");
+  equal(root.y, 0, "the plan's root sits at the top of it");
+  assertNoOverlap(document, "a plan document");
+})();
+
 // The real store, when one is reachable. Point at it with FLOW_STORE; skipped
 // silently when absent, so this file passes on a machine that has never run the
 // extractor.
@@ -233,6 +278,26 @@ function assertNoOverlap(document, label) {
     }
   }
   console.log("checked " + seen + " document(s) from " + store);
+})();
+
+// Every plan actually on disk, when the directory is reachable.
+(function theRealPlans() {
+  const dir = process.env.FLOW_PLANS;
+  if (!dir || !fs.existsSync(dir)) return;
+  let seen = 0;
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith(".plan.json")) continue;
+    const document = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+    const laid = L.flowLayout(document);
+    equal(
+      laid.positions.size,
+      (document.nodes || []).length,
+      "every node of real plan " + file + " is placed"
+    );
+    assertNoOverlap(document, "real plan " + file);
+    seen += 1;
+  }
+  console.log("checked " + seen + " plan(s) from " + dir);
 })();
 
 console.log((checks - failures) + "/" + checks + " layout checks passed");

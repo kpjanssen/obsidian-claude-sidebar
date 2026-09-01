@@ -495,3 +495,20 @@
 .flow-empty-note {
 	color: var(--text-faint);
 }
+
+/* A plan is a definition, not a record of a run. Two separate marks, because
+   either alone can be missed: the boxes are dashed on the drawing itself, and
+   the status line carries the word. */
+.flow-graph-canvas.is-plan .flow-node-box {
+	stroke-dasharray: 4 3;
+}
+
+.flow-status-plan {
+	display: inline-block;
+	margin-right: 8px;
+	padding: 0 6px;
+	border: 1px dashed var(--text-accent);
+	border-radius: 4px;
+	color: var(--text-accent);
+	font-size: var(--font-ui-smaller);
+}
