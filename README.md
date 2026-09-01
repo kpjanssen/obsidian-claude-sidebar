@@ -125,7 +125,7 @@ plugin:
 
 **The vault copy is deployed, never edited in place.** `deploy.py` copies
 `manifest.json`, `main.js`, `styles.css` and `LICENSE` from this repository
-into `<vault>/.obsidian/plugins/flow-terminal/`, overwriting whatever is
+into `<vault>/.obsidian/plugins/proj-flow/`, overwriting whatever is
 there. It never opens a file already at the destination and patches it — the
 source of record is always this repository. Making a change means editing
 the file here, running `./build.sh` if the PTY wrappers changed, then

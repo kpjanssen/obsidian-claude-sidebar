@@ -1,6 +1,6 @@
 {
-  "id": "flow-terminal",
-  "name": "Flow Terminal and Run Graph",
+  "id": "proj-flow",
+  "name": "Proj Flow",
   "version": "0.1.0",
   "minAppVersion": "1.0.0",
   "description": "An agent CLI terminal in the sidebar, alongside a read-only run graph of what the agents did. A fork of Claude Sidebar by Derek Larson; see UPSTREAM.md.",
