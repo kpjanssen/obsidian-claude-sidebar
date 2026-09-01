@@ -116,6 +116,49 @@ The PTY scripts (`terminal_pty.py` for Unix, `terminal_win.py` for Windows) are 
 ./build.sh
 ```
 
+## Deploying (fork)
+
+This fork adds a read-only run-graph pane over [proj-flow](../proj-flow)'s
+generated documents; see `UPSTREAM.md` for the lineage and `CLAUDE.md` for
+what changed. Two things follow from being a fork rather than the upstream
+plugin:
+
+**The vault copy is deployed, never edited in place.** `deploy.py` copies
+`manifest.json`, `main.js`, `styles.css` and `LICENSE` from this repository
+into `<vault>/.obsidian/plugins/flow-terminal/`, overwriting whatever is
+there. It never opens a file already at the destination and patches it — the
+source of record is always this repository. Making a change means editing
+the file here, running `./build.sh` if the PTY wrappers changed, then
+redeploying:
+
+```bash
+python deploy.py               # defaults to ~/OneDrive/Vault
+python deploy.py --vault PATH  # or name the vault explicitly
+```
+
+`data.json` — where Obsidian stores this plugin's own settings once you've
+used it — is deliberately not part of the deployed bundle. A redeploy never
+touches it, so your settings survive.
+
+**Whether the deployed bundle itself is tracked by the vault's own git
+repository is an open decision for the vault owner**, not settled by this
+script. Every other plugin currently installed in that vault (`dataview`,
+`claude-sidebar`, and the rest) *is* tracked there, which is the existing
+precedent, but a decision made for those plugins is not automatically a
+decision made for this one — it is recorded as open rather than assumed.
+Either way, the licence ships in the deployed copy: `deploy.py` always
+copies `LICENSE` alongside the code it covers.
+
+**Checking whether upstream moved.** `upstream_check.py` is read-only
+against the GitHub API — it writes no file under any outcome — and reports
+commits and releases published since the commit recorded in `UPSTREAM.md`.
+An unreachable GitHub is reported as unavailable, never silently treated as
+"nothing changed":
+
+```bash
+python upstream_check.py
+```
+
 ## Contributing
 
 Hit a bug or want to develop a new feature? Point your coding agent at `CLAUDE.md` in this repo. It will walk you through diagnosis, filing a report, or opening a PR.
