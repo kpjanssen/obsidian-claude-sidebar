@@ -29,7 +29,7 @@ function loadLayout() {
   // function is called, and this file calls only the pure layout ones.
   const factory = new Function(
     region +
-      "\nreturn { flowLayout, FLOW_NODE_W, FLOW_NODE_H, FLOW_COLUMN, FLOW_ROW, FLOW_MAX_ROWS, FLOW_MAX_BAND_RUN };"
+      "\nreturn { flowLayout, FLOW_NODE_W, FLOW_NODE_H, FLOW_COLUMN, FLOW_ROW, FLOW_MAX_ROWS, FLOW_MAX_BAND_RUN, FLOW_GROUP_HEAD };"
   );
   return factory();
 }
@@ -298,6 +298,101 @@ function assertNoOverlap(document, label) {
     seen += 1;
   }
   console.log("checked " + seen + " plan(s) from " + dir);
+})();
+
+// A trigger inventory has no tree in it at all: every mechanism is a top-level
+// fact about the machine, so the tree walk would place one node and drop every
+// other into the orphan column. The flat branch groups by kind instead, and
+// these checks are what tells the two branches apart.
+function triggerInventory(counts) {
+  const nodes = [];
+  let ordinal = 0;
+  for (const pair of counts) {
+    for (let i = 0; i < pair[1]; i++) {
+      nodes.push({
+        "graph.node.id": "trigger:" + pair[0] + ":" + i,
+        "graph.node.name": pair[0] + " " + i,
+        kind: pair[0],
+        ordinal: ordinal++,
+        enabled: true,
+        liveness: "observed"
+      });
+    }
+  }
+  return { schema_version: 2, kind: "trigger-inventory", host: "A-MACHINE", nodes, edges: [] };
+}
+
+(function aTriggerInventoryGroupsByKind() {
+  const document = triggerInventory([["scheduled_task", 14], ["claude_hook", 3], ["git_hook", 2]]);
+  const laid = L.flowLayout(document);
+  equal(laid.positions.size, 19, "every trigger is placed");
+  assertNoOverlap(document, "trigger inventory");
+
+  const columnsOf = (kind) =>
+    new Set(
+      document.nodes
+        .filter((n) => n.kind === kind)
+        .map((n) => laid.positions.get(n["graph.node.id"]).x)
+    );
+  equal(columnsOf("scheduled_task").size, 2, "14 scheduled tasks wrap into two columns");
+  equal(columnsOf("claude_hook").size, 1, "3 claude hooks fit one column");
+
+  // One blank column between groups, so a group reads as a group and not as
+  // the tail of the one before it.
+  const scheduled = Math.max.apply(null, Array.from(columnsOf("scheduled_task")));
+  const hooks = Math.min.apply(null, Array.from(columnsOf("claude_hook")));
+  equal(hooks - scheduled, 2 * L.FLOW_COLUMN, "a blank column separates two groups");
+
+  equal((laid.groups || []).length, 3, "one heading per kind");
+  equal(laid.groups[0].kind, "scheduled_task", "headings keep the document's kind order");
+  equal(laid.groups[0].count, 14, "a heading states how many are under it");
+  const top = Math.min.apply(null, Array.from(laid.positions.values()).map((p) => p.y));
+  check(laid.groups[0].y < top, "headings sit above the first row, not on it");
+  check(laid.groups.every((g) => g.y >= 0), "no heading is normalised off the top of the drawing");
+})();
+
+(function aRunGraphIsStillATree() {
+  // The flat branch must not capture a run graph, whose session node is the one
+  // parentless node. This is the regression guard for the condition itself.
+  const document = runGraph(2, 3);
+  const laid = L.flowLayout(document);
+  equal((laid.groups || []).length, 0, "a run graph draws no group headings");
+  assertNoOverlap(document, "run graph after the flat branch was added");
+})();
+
+(function aSingleNodeIsNotGrouped() {
+  const document = {
+    schema_version: 2,
+    kind: "run",
+    nodes: [{ "graph.node.id": "session:x", kind: "session" }]
+  };
+  const laid = L.flowLayout(document);
+  equal((laid.groups || []).length, 0, "one node alone is not a group");
+  equal(laid.positions.size, 1, "and it is still placed");
+})();
+
+// The inventory actually on disk, when the store is reachable.
+(function theRealInventory() {
+  const store = process.env.FLOW_STORE;
+  if (!store || !fs.existsSync(store)) return;
+  let seen = 0;
+  for (const file of fs.readdirSync(store)) {
+    if (!file.endsWith(".triggers.json")) continue;
+    const document = JSON.parse(fs.readFileSync(path.join(store, file), "utf8"));
+    const laid = L.flowLayout(document);
+    equal(
+      laid.positions.size,
+      (document.nodes || []).length,
+      "every node of real inventory " + file + " is placed"
+    );
+    check(
+      (laid.groups || []).length > 0 && laid.groups.length < 8,
+      "real inventory " + file + " draws one heading per kind, not one per node"
+    );
+    assertNoOverlap(document, "real inventory " + file);
+    seen += 1;
+  }
+  console.log("checked " + seen + " trigger inventory/inventories from " + store);
 })();
 
 console.log((checks - failures) + "/" + checks + " layout checks passed");
