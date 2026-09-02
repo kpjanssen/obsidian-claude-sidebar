@@ -9093,6 +9093,11 @@ var FLOW_PAYLOAD_BOUND = 1200;
 // them again on sync. Coalesce into one re-render.
 var FLOW_WATCH_DEBOUNCE_MS = 300;
 
+// How far the pointer may travel between press and release and still be
+// read as a press on a node rather than a pan. Measured from where the
+// press started, not from the previous move.
+var FLOW_DRAG_SLOP = 4;
+
 function flowGraphRoot(app) {
   const base = app.vault.adapter.basePath || "";
   if (!base) return null;
@@ -10133,6 +10138,9 @@ var FlowGraphPane = class {
       group.addEventListener("click", (event) => {
         event.stopPropagation();
         if (this._dragged) return;
+        // The pointerup above has normally already selected this node. Redoing
+        // it would rebuild the detail pane under the reader for no gain.
+        if (this.selectedNodeId === id) return;
         this.renderDetail(id);
       });
       group.addEventListener("keydown", (event) => {
@@ -10181,24 +10189,66 @@ var FlowGraphPane = class {
       this.zoomAt(px, py, factor);
     }, { passive: false });
 
+    // Selecting a node is settled here, from the pointer pair, and not from the
+    // `click` event the node itself listens for. Measured on 2026-09-02 against
+    // the live store: the canvas panned and zoomed while pressing a node did
+    // nothing at all -- so the press was arriving at this element and the click
+    // was being lost somewhere between press and release. What the press landed
+    // on is a fact this handler already has; the click event's own idea of its
+    // target is not needed to read it. The node's click listener is left in
+    // place as a second path rather than removed, because a path that already
+    // works on some machine should not be taken away to fix one where it does
+    // not.
     let dragging = false;
     let lastX = 0;
     let lastY = 0;
+    let downX = 0;
+    let downY = 0;
+    let downNodeId = null;
+    let captured = false;
+
+    // The node under a pointer event, or null. A press lands on the box, the
+    // title text or the tooltip -- none of which carry the id -- so the group
+    // above it is the thing to find.
+    const nodeIdAt = (event) => {
+      const target = event.target;
+      if (target && typeof target.closest === "function") {
+        const hit = target.closest(".flow-node");
+        if (hit) return hit.getAttribute("data-flow-node-id");
+      }
+      // A target that cannot be walked still has a position, and the document
+      // can be asked what is drawn there.
+      const under = document.elementFromPoint(event.clientX, event.clientY);
+      const hit = under && typeof under.closest === "function" ? under.closest(".flow-node") : null;
+      return hit ? hit.getAttribute("data-flow-node-id") : null;
+    };
+
     canvas.addEventListener("pointerdown", (event) => {
       if (!this.sceneEl) return;
       dragging = true;
       this._dragged = false;
-      lastX = event.clientX;
-      lastY = event.clientY;
-      canvas.setPointerCapture(event.pointerId);
+      downNodeId = nodeIdAt(event);
+      lastX = downX = event.clientX;
+      lastY = downY = event.clientY;
+      try {
+        canvas.setPointerCapture(event.pointerId);
+        captured = true;
+      } catch (_) {
+        captured = false;
+      }
     });
     canvas.addEventListener("pointermove", (event) => {
       if (!dragging) return;
       const dx = event.clientX - lastX;
       const dy = event.clientY - lastY;
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) this._dragged = true;
       lastX = event.clientX;
       lastY = event.clientY;
+      // Measured from where the press started rather than from the previous
+      // move: a slow drag arrives as a run of one-pixel steps, and a per-step
+      // threshold would read the whole of it as a press.
+      if (Math.abs(event.clientX - downX) > FLOW_DRAG_SLOP || Math.abs(event.clientY - downY) > FLOW_DRAG_SLOP) {
+        this._dragged = true;
+      }
       this.tx += dx;
       this.ty += dy;
       this.applyTransform();
@@ -10206,7 +10256,16 @@ var FlowGraphPane = class {
     const stop = (event) => {
       if (!dragging) return;
       dragging = false;
-      try { canvas.releasePointerCapture(event.pointerId); } catch (_) {}
+      if (captured) {
+        try { canvas.releasePointerCapture(event.pointerId); } catch (_) {}
+        captured = false;
+      }
+      const pressed = downNodeId;
+      downNodeId = null;
+      // A cancelled pointer is not a press: it selects nothing.
+      if (event.type === "pointerup" && !this._dragged && pressed) {
+        this.renderDetail(pressed);
+      }
       window.setTimeout(() => { this._dragged = false; }, 0);
     };
     canvas.addEventListener("pointerup", stop);
