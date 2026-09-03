@@ -311,6 +311,13 @@
 	font-family: var(--font-monospace);
 }
 
+.flow-node-detail {
+	fill: var(--text-faint, var(--text-muted));
+	font-size: 9px;
+	font-family: var(--font-interface);
+	font-style: italic;
+}
+
 .flow-node-session .flow-node-box {
 	fill: var(--background-modifier-hover);
 	stroke: var(--text-muted);

@@ -9571,6 +9571,19 @@ function flowTooltip(node) {
   return lines.join("\n");
 }
 
+// The third line of a node face: the brief description. A session's title says
+// what it was called and not what it was for, and being unable to tell those
+// apart without hovering was the complaint. The opening instruction is the
+// nearest recorded thing to a description -- `docs/graph-schema.md` records
+// why no summary record exists to use instead, and why synthesising one here
+// would be inventing the one field a reader trusts most. Every other kind
+// already carries its description on line one as its `summary`, so it gets no
+// third line rather than a padded one.
+function flowDetailFace(node) {
+  if (node.kind !== "session") return "";
+  return node.first_prompt ? "asked: " + node.first_prompt : "";
+}
+
 function flowNodeClass(node) {
   const kind = node.kind || "";
   if (kind === "session") return "flow-node-session";
@@ -10126,12 +10139,22 @@ var FlowGraphPane = class {
         badge.appendChild(badgeTitle);
         group.appendChild(badge);
       }
-      const title = flowSvg("text", { class: "flow-node-title", x: 10, y: 20 });
+      // A node carrying a third line packs three baselines into the same box
+      // rather than growing it: the row pitch is derived from FLOW_NODE_H, so
+      // a taller box would overlap the row beneath it. A two-line node keeps
+      // the roomier baselines it had.
+      const detail = flowDetailFace(node);
+      const title = flowSvg("text", { class: "flow-node-title", x: 10, y: detail ? 17 : 20 });
       title.textContent = flowClip(flowFace(node), 26);
       group.appendChild(title);
-      const sub = flowSvg("text", { class: "flow-node-sub", x: 10, y: 37 });
+      const sub = flowSvg("text", { class: "flow-node-sub", x: 10, y: detail ? 30 : 37 });
       sub.textContent = flowClip(flowSubFace(node), 30);
       group.appendChild(sub);
+      if (detail) {
+        const third = flowSvg("text", { class: "flow-node-detail", x: 10, y: 43 });
+        third.textContent = flowClip(detail, 32);
+        group.appendChild(third);
+      }
       const tip = flowSvg("title", {});
       tip.textContent = flowTooltip(node);
       group.appendChild(tip);
@@ -10556,6 +10579,12 @@ var FlowGraphPane = class {
       anchor
     );
     this.addOpenButton(actions, "canvas", stem + ".canvas", null);
+    // What was actually said, mirrored into the vault by `flow render` so that
+    // the thing a reader most wants from a session node is a file Obsidian can
+    // open rather than a path to a transcript it cannot. A graph rendered
+    // before that note existed has nothing at this path, and addOpenButton
+    // already says so rather than offering a button that does nothing.
+    this.addOpenButton(actions, "conversation", stem + " conversation.md", null);
     if (doc.profile && doc.session_file) {
       const full = path.join(doc.profile, doc.session_file);
       section.createDiv({
