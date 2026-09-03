@@ -28,6 +28,7 @@ function loadRegion() {
     source.slice(from, to) +
       "\nreturn { flowSessionNode, flowRootNode, flowAnchor, flowSummarise, flowFace, flowSubFace," +
       " flowTooltip, flowNodeClass, flowIsTrigger, flowTriggerState, flowValidateDocument," +
+      " flowDetailFace," +
       " FLOW_SUPPORTED_KINDS, FLOW_TRIGGER_KINDS };"
   )();
 }
@@ -387,6 +388,74 @@ equal(
     seen += 1;
   }
   console.log("checked " + seen + " trigger inventory/inventories from " + store);
+})();
+
+// ---- an agent-bearing node names its agent, not its kind -------------------
+// The complaint this answers: the graph read as a wall of task descriptions
+// with nothing saying what had run them. Measured over the live store on
+// 2026-09-03, all 269 dispatch faces drew the word "dispatch" on line two and
+// not one drew its agent type, because `model` is always present and the old
+// `else if` only reached `agent_type` when it was absent.
+{
+  const ran = {
+    kind: "dispatch",
+    agent_type: "session-extractor",
+    outcome: "completed",
+    model: "sonnet",
+    vault_touches: [{ path: "a" }, { path: "b" }],
+    "graph.node.id": "dispatch:1",
+  };
+  equal(F.flowSubFace(ran), "session-extractor · completed", "line two names the agent");
+  equal(F.flowDetailFace(ran), "sonnet · 2 files", "line three carries model and reach");
+  equal(
+    F.flowDetailFace(Object.assign({}, ran, { vault_touches: [{ path: "a" }] })),
+    "sonnet · 1 file",
+    "one touch is singular"
+  );
+  equal(
+    F.flowDetailFace(Object.assign({}, ran, { vault_touches: [] })),
+    "sonnet",
+    "a dispatch that touched nothing says only what ran, not '0 files'"
+  );
+
+  // The regression guard on the other side: a node with no agent must keep the
+  // face it had, model included, or this change quietly rewrites every
+  // orchestrator and join in the store.
+  const structural = { kind: "join", outcome: "completed", model: "opus", "graph.node.id": "join:1" };
+  equal(F.flowSubFace(structural), "join · completed · opus", "a kind without an agent is unchanged");
+  equal(F.flowDetailFace(structural), "", "and gains no third line");
+
+  // A session is untouched by all of it.
+  equal(
+    F.flowDetailFace({ kind: "session", first_prompt: "mirror the sessions" }),
+    "asked: mirror the sessions",
+    "a session still opens with what it was asked"
+  );
+}
+
+// ---- and both new lines survive their clips on real data -------------------
+(() => {
+  const store = process.env.FLOW_STORE;
+  if (!store || !fs.existsSync(store)) return;
+  let agents = 0;
+  for (const project of fs.readdirSync(store)) {
+    const dir = path.join(store, project);
+    if (!fs.statSync(dir).isDirectory()) continue;
+    for (const file of fs.readdirSync(dir)) {
+      if (!file.endsWith(".graph.json")) continue;
+      const document = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+      for (const node of document.nodes || []) {
+        if (!node.agent_type) continue;
+        agents += 1;
+        const sub = F.flowSubFace(node);
+        const detail = F.flowDetailFace(node);
+        check(sub.length <= 30, file + ": '" + sub + "' survives the 30-char clip");
+        check(detail.length <= 32, file + ": '" + detail + "' survives the 32-char clip");
+        check(sub.indexOf("dispatch") !== 0, file + ": " + node["graph.node.id"] + " leads with its agent");
+      }
+    }
+  }
+  console.log("checked " + agents + " agent-bearing node(s) for clip fit");
 })();
 
 console.log((checks - failures) + "/" + checks + " face checks passed");

@@ -9549,10 +9549,21 @@ function flowSubFace(node) {
     // node sits under, by its colour, and in words by the hover text.
     return flowTriggerState(node);
   }
-  const parts = [String(node.kind || "?").replace(/_/g, " ")];
+  // A node that ran an agent says which agent, not that it was a dispatch.
+  // The kind is already carried three other ways -- the box colour, the group
+  // the node sits under, and the hover text -- while `general-purpose` against
+  // `session-extractor` is the one thing about a dispatch that appears nowhere
+  // else in the drawing. Measured 2026-09-03 over the live store: all 269
+  // dispatch faces drew the word "dispatch" and not one drew its agent type,
+  // because `model` is always present and took the slot the `else if` below
+  // only ever gave to `agent_type` when it was absent.
+  //
+  // The model is not dropped, it moves to the third line, which has room for
+  // it. Two facts fit in 30 characters and three do not:
+  // "session-extractor · completed" is 29.
+  const parts = [node.agent_type || String(node.kind || "?").replace(/_/g, " ")];
   if (node.outcome) parts.push(node.outcome);
-  if (node.model) parts.push(node.model);
-  else if (node.agent_type) parts.push(node.agent_type);
+  if (!node.agent_type && node.model) parts.push(node.model);
   return parts.join(" · ");
 }
 
@@ -9580,8 +9591,22 @@ function flowTooltip(node) {
 // already carries its description on line one as its `summary`, so it gets no
 // third line rather than a padded one.
 function flowDetailFace(node) {
-  if (node.kind !== "session") return "";
-  return node.first_prompt ? "asked: " + node.first_prompt : "";
+  if (node.kind === "session") return node.first_prompt ? "asked: " + node.first_prompt : "";
+  // An agent-bearing node's third line carries what its second no longer has
+  // room for: the model that actually ran, and how much of the vault the agent
+  // went on to touch. Both are recorded fields. Neither is a summary of what
+  // the agent concluded -- `docs/graph-schema.md` refuses to synthesise one,
+  // and the whole value of a face line is that a reader can trust it.
+  //
+  // Inheritance is deliberately not spelled out here; the badge drawn beside
+  // the title already marks a model inherited rather than pinned, and saying
+  // it twice would spend the clip budget on a fact already on screen.
+  if (!node.agent_type) return "";
+  const parts = [];
+  if (node.model) parts.push(node.model);
+  const touches = Array.isArray(node.vault_touches) ? node.vault_touches.length : 0;
+  if (touches) parts.push(touches + (touches === 1 ? " file" : " files"));
+  return parts.join(" · ");
 }
 
 function flowNodeClass(node) {
