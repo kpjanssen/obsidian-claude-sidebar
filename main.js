@@ -10584,7 +10584,21 @@ var FlowGraphPane = class {
     // open rather than a path to a transcript it cannot. A graph rendered
     // before that note existed has nothing at this path, and addOpenButton
     // already says so rather than offering a button that does nothing.
-    this.addOpenButton(actions, "conversation", stem + " conversation.md", null);
+    //
+    // That note carries a section per subagent under the same anchor the
+    // payload note uses, so a dispatch opens at its own conversation rather
+    // than at the top of the parent's. `interior.source` is the document's own
+    // statement that a subagent transcript was read; a dispatch without one
+    // has no section, and pointing at an anchor that is not there would land
+    // the reader at the top with nothing saying why.
+    const talkAnchor =
+      node.interior && node.interior.source ? "#" + flowAnchor(node["graph.node.id"]) : null;
+    this.addOpenButton(
+      actions,
+      talkAnchor ? "conversation, at this subagent" : "conversation",
+      stem + " conversation.md",
+      talkAnchor
+    );
     if (doc.profile && doc.session_file) {
       const full = path.join(doc.profile, doc.session_file);
       section.createDiv({
