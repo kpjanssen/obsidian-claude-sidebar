@@ -154,6 +154,40 @@ equal(
 );
 equal(F.flowConfigDir({}, { home: "", processEnv: {} }), null, "with no home at all there is no answer to give");
 
+// ---- task 8.3/8.6: the fork invents no location of its own -----------------
+// The pieces above assert the precedence and the shape separately. This states
+// the property those pieces exist to guarantee, because that is the one a
+// reader of the task list is actually asking about: a session started in the
+// hosted terminal writes its transcript where Claude Code would have written it
+// anyway. The fork hosts a terminal; it does not relocate what runs inside one.
+const hosted = F.flowTranscriptPath(
+  F.flowConfigDir({}, { home: "/home/k", processEnv: {} }),
+  "/home/k/Vault",
+  "abc-123"
+);
+equal(
+  hosted,
+  path.join("/home/k", ".claude", "projects", "-home-k-Vault", "abc-123.jsonl"),
+  "with nothing configured, the transcript lands in the ordinary profile location"
+);
+for (const invented of ["claude-sidebar", "proj-flow", "plugins", ".obsidian"]) {
+  check(
+    hosted.indexOf(invented) === -1,
+    "the hosted transcript path contains nothing plugin-specific: " + invented
+  );
+}
+// And when the operator *does* redirect it, the redirection is theirs and is
+// obeyed exactly -- the fork neither ignores it nor decorates it.
+equal(
+  F.flowTranscriptPath(
+    F.flowConfigDir({ CLAUDE_CONFIG_DIR: "/elsewhere" }, { home: "/home/k", processEnv: {} }),
+    "/home/k/Vault",
+    "abc-123"
+  ),
+  path.join("/elsewhere", "projects", "-home-k-Vault", "abc-123.jsonl"),
+  "a configured profile is obeyed exactly, with nothing added to it"
+);
+
 // ---- scanning a chunk of transcript ---------------------------------------
 const EMPTY = { title: null, cwd: null, branch: null };
 

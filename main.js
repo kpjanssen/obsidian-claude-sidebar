@@ -9995,6 +9995,54 @@ function flowDocumentKind(doc) {
   return doc.kind;
 }
 
+// The one directory name the personal profile answers to, and the marker that
+// names a professional-vault root. Both are string facts rather than paths, on
+// purpose: a stored absolute path would be wrong on the other machine, and
+// `flow/profile.py::resolve_profile` takes no argument for the same reason --
+// there is no parameter to override, because an override is the thing the
+// boundary forbids. Nothing here reads the filesystem or the home directory,
+// so the check behaves identically in Obsidian and under `node test/`.
+var FLOW_PERSONAL_PROFILE_DIRNAME = ".claude-personal";
+var FLOW_WORK_ROOT_MARKER = "onedrive - ";
+
+// Task 6.3. A run graph records the profile it was extracted from. A document
+// naming any other profile is refused rather than drawn: this pane lives in the
+// personal vault, and drawing a foreign session would put its titles and its
+// opening prompts on screen here -- which is the content crossing, whatever the
+// file happens to be called. The boundary is not overridable and there is no
+// setting that widens it.
+//
+// Two separate things are caught, because they fail differently. The work
+// profile is `~/.claude` and carries no vault marker at all, so only the
+// directory name tells it from the personal one; a profile placed *inside* a
+// professional vault carries the marker and would otherwise pass a name check.
+//
+// Absent stays absent: a plan and a trigger inventory record no profile because
+// they were not extracted from one, and nothing is asserted about them.
+function flowProfileProblem(recorded) {
+  if (!recorded) return null;
+  const segments = String(recorded).split(/[\\/]+/).filter(Boolean);
+  for (let i = 0; i < segments.length; i++) {
+    if (segments[i].toLowerCase().indexOf(FLOW_WORK_ROOT_MARKER) === 0) {
+      return (
+        "This document was extracted from a profile inside a professional vault. " +
+        "The cross-vault content boundary is not overridable, so it is named here " +
+        "rather than drawn."
+      );
+    }
+  }
+  const last = segments.length ? segments[segments.length - 1] : "";
+  if (last !== FLOW_PERSONAL_PROFILE_DIRNAME) {
+    return (
+      "This document was extracted from a profile named " +
+      JSON.stringify(last || String(recorded)) +
+      ", and this view reads only " + FLOW_PERSONAL_PROFILE_DIRNAME +
+      ". The cross-vault content boundary is not overridable."
+    );
+  }
+  return null;
+}
+
 // Refuses an unknown schema_version or an unsupported kind by naming what was
 // found, and never draws it. The pane lists two suffixes and each is written
 // by one kind today, so on the store as it exists this is a second line of
@@ -10029,6 +10077,10 @@ function flowValidateDocument(doc) {
         JSON.stringify(kind) +
         "."
     };
+  }
+  const foreign = flowProfileProblem(doc.profile);
+  if (foreign) {
+    return { ok: false, problem: foreign };
   }
   return { ok: true, problem: null };
 }

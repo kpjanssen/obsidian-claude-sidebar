@@ -184,6 +184,44 @@ check(
   !F.flowValidateDocument({ schema_version: 9, kind: "plan", nodes: [] }).ok,
   "an unsupported schema version is still refused, kind notwithstanding"
 );
+// ---- the profile a document was extracted from (task 6.3) ----------------
+// The pane lives in the personal vault. A run graph extracted from any other
+// profile is refused rather than drawn, because drawing it would put a foreign
+// session's title and opening prompt on screen here -- the content crossing the
+// boundary forbids, whatever the file is called. Pure string checks on purpose:
+// no home directory, no filesystem, so this behaves the same in Obsidian as it
+// does here, and is correct on both machines.
+const BS = String.fromCharCode(92);  // no escape sequences below: a backslash in a JS
+function win() { return Array.prototype.slice.call(arguments).join(BS); }  // string literal,
+function run(profile) {  // written through two layers of quoting, is what broke this block once
+
+  return { schema_version: 2, kind: "run", nodes: [], profile: profile };
+}
+check(
+  F.flowValidateDocument(run(win("C:", "Users", "someone", ".claude-personal"))).ok,
+  "a run graph from the personal profile is accepted"
+);
+check(
+  F.flowValidateDocument(run("/home/someone/.claude-personal")).ok,
+  "the same profile with posix separators is accepted"
+);
+check(
+  !F.flowValidateDocument(run(win("C:", "Users", "someone", ".claude"))).ok,
+  "the work profile is refused, and it differs by its directory name alone"
+);
+check(
+  !F.flowValidateDocument(run(win("C:", "Users", "someone", "OneDrive - Some Employer", "p", ".claude-personal"))).ok,
+  "a profile inside a professional vault is refused even though its name is right"
+);
+check(
+  /boundary/.test(F.flowValidateDocument(run(win("C:", "Users", "someone", ".claude"))).problem),
+  "the refusal names the boundary rather than only saying no"
+);
+check(
+  F.flowValidateDocument({ schema_version: 2, kind: "plan", nodes: [] }).ok,
+  "a plan records no profile because it was extracted from none, and absent stays absent"
+);
+
 equal(
   F.FLOW_SUPPORTED_KINDS.join(","),
   "run,plan,trigger-inventory",
