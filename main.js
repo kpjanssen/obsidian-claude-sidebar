@@ -6896,6 +6896,12 @@ var TerminalView = class extends import_obsidian.ItemView {
     this._shellStarted = false;
     // The run-graph pane, built on first use by showPane().
     this.flowPane = null;
+    // What this tab is called, read from the transcript rather than from
+    // anything typed here. See the session-header region.
+    this.sessionHeader = { title: null, cwd: null, branch: null };
+    this.headerFile = null;
+    this.headerOffset = 0;
+    this.headerWatcher = null;
   }
   getBackendKey() {
     const key = this.backendKey || this.plugin.pluginData.cliBackend || "claude";
@@ -6934,6 +6940,9 @@ var TerminalView = class extends import_obsidian.ItemView {
     }
     if (state?.sessionId) {
       this.sessionId = state.sessionId;
+      // A restored tab can name itself before its shell is back: the
+      // transcript it is about to resume is already on disk.
+      this.bindSessionHeader();
     }
     // If shell already started, restart with new settings
     if (this.proc && (state?.workingDir || state?.yoloMode || state?.continueSession || state?.backendKey)) {
@@ -7332,6 +7341,13 @@ var TerminalView = class extends import_obsidian.ItemView {
     const container = this.containerEl;
     container.empty();
     container.addClass("flow-terminal");
+    // Above the tab strip rather than inside the terminal pane: what a tab is
+    // called is a fact about the tab, and it stays true while you are reading
+    // the run graph beside it.
+    this.headerEl = container.createDiv({ cls: "flow-session-header" });
+    this.headerTitleEl = this.headerEl.createDiv({ cls: "flow-session-title" });
+    this.headerMetaEl = this.headerEl.createDiv({ cls: "flow-session-meta" });
+    this.renderSessionHeader();
     // One view, two surfaces (task 8.5). The terminal is the default and is
     // fully usable with no run-graph document present: the graph is additive
     // to the terminal and never a precondition for it.
@@ -7375,6 +7391,141 @@ var TerminalView = class extends import_obsidian.ItemView {
       this.flowPane.refresh({ keepSelection: true });
     }
   }
+  // -- session header ------------------------------------------------------
+
+  // Called whenever the id this tab points at can have changed: on restore, and
+  // again each time startShell claims a fresh one. Re-binding the same file is a
+  // no-op, so calling it more often than necessary costs one path join.
+  bindSessionHeader(cwd) {
+    const dir = cwd || this.workingDir || this.plugin.pluginData.lastCwd || this.plugin.getVaultPath();
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    const envVars = flowEnvVars(this.plugin.pluginData.claudeEnvVars, {
+      user: flowCurrentUser(),
+      home
+    });
+    const file = flowTranscriptPath(
+      flowConfigDir(envVars, { home, processEnv: process.env }),
+      dir,
+      this.sessionId
+    );
+    if (file === this.headerFile) return;
+    this.unwatchSessionHeader();
+    this.headerFile = file;
+    this.headerOffset = 0;
+    this.sessionHeader = { title: null, cwd: null, branch: null };
+    this.renderSessionHeader();
+    if (!file) return;
+    this.headerWatcher = () => this.readSessionHeader();
+    // Polled rather than fs.watch: the file is appended to several times a
+    // second by another process, and a watch that fired per write would do far
+    // more work than one stat every two seconds. Two seconds is also about how
+    // long it takes to notice a header that has gone stale, which is the only
+    // deadline this has.
+    fs.watchFile(file, { interval: 2e3 }, this.headerWatcher);
+    this.readSessionHeader();
+  }
+
+  unwatchSessionHeader() {
+    if (this.headerFile && this.headerWatcher) {
+      fs.unwatchFile(this.headerFile, this.headerWatcher);
+    }
+    this.headerWatcher = null;
+  }
+
+  readSessionHeader() {
+    const file = this.headerFile;
+    if (!file) return;
+    let size;
+    try {
+      size = fs.statSync(file).size;
+    } catch (_) {
+      // Not written yet. Normal for the first seconds of a session, and
+      // permanent for a tab whose backend is not Claude Code.
+      return;
+    }
+    if (size < this.headerOffset) {
+      // The file was replaced rather than appended to. Start again rather than
+      // read from an offset that now points into the middle of a record.
+      this.headerOffset = 0;
+      this.sessionHeader = { title: null, cwd: null, branch: null };
+    }
+    if (size === this.headerOffset) return;
+    let text;
+    let fd = null;
+    try {
+      fd = fs.openSync(file, "r");
+      const length = size - this.headerOffset;
+      const buf = Buffer.allocUnsafe(length);
+      const read = fs.readSync(fd, buf, 0, length, this.headerOffset);
+      if (read <= 0) return;
+      // Stop at the last newline. The bytes after it are a record Claude Code is
+      // still writing; decoding them would parse half a record and could cut a
+      // multi-byte character in two. Leaving them unread costs one more poll.
+      const end = buf.lastIndexOf(10, read - 1);
+      if (end === -1) return;
+      text = buf.toString("utf8", 0, end + 1);
+      this.headerOffset += end + 1;
+    } catch (err) {
+      console.error("[Flow Terminal] Could not read the session transcript:", err);
+      return;
+    } finally {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch (_) {}
+      }
+    }
+    const next = flowScanHeader(text, this.sessionHeader);
+    if (flowHeaderEqual(next, this.sessionHeader)) return;
+    this.sessionHeader = next;
+    this.renderSessionHeader();
+  }
+
+  renderSessionHeader() {
+    if (!this.headerTitleEl || !this.headerMetaEl) return;
+    const state = this.sessionHeader || {};
+    const titled = !!state.title;
+    this.headerTitleEl.setText(titled ? state.title : "Untitled session");
+    this.headerTitleEl.classList.toggle("is-untitled", !titled);
+    this.headerTitleEl.setAttr(
+      "title",
+      titled
+        ? state.title
+        : "Claude names a session once there is something to name; this one has not been named yet."
+    );
+    this.headerMetaEl.empty();
+    // The transcript's own cwd wins where it exists, because it is what the
+    // running session reports rather than what this tab asked for.
+    const cwd = state.cwd || this.workingDir || this.plugin.pluginData.lastCwd || this.plugin.getVaultPath();
+    const parts = [];
+    if (cwd) parts.push({ cls: "flow-session-project", text: path.basename(cwd), tip: cwd });
+    if (state.branch) parts.push({ cls: "flow-session-branch", text: state.branch, tip: "git branch" });
+    if (this.sessionId) {
+      parts.push({
+        cls: "flow-session-id",
+        text: this.sessionId.slice(0, 8),
+        tip: this.sessionId + " \u2014 click to copy",
+        copy: this.sessionId
+      });
+    }
+    parts.forEach((part, index) => {
+      if (index) this.headerMetaEl.createSpan({ cls: "flow-session-sep", text: "\u00b7" });
+      const el = this.headerMetaEl.createSpan({ cls: part.cls, text: part.text });
+      el.setAttr("title", part.tip);
+      if (!part.copy) return;
+      // The short id is the one thing here you might want to paste somewhere --
+      // into a --resume, or into a path under projects/. Acknowledged in place
+      // rather than with a notice, because this plugin raises none anywhere
+      // else and one toast for a copied id would be the loudest thing in it.
+      el.addClass("is-copyable");
+      el.addEventListener("click", () => {
+        navigator.clipboard?.writeText(part.copy);
+        el.setText("copied");
+        window.setTimeout(() => el.setText(part.text), 1200);
+      });
+    });
+  }
+
   getThemeColors() {
     const styles = getComputedStyle(document.body);
     const bg = styles.getPropertyValue("--background-secondary").trim() || "#1e1e1e";
@@ -8051,6 +8202,10 @@ var TerminalView = class extends import_obsidian.ItemView {
     }
     if (!attempts.includes(baseCmd)) attempts.push(baseCmd);
     const cliChain = attempts.join(" || ");
+    // The id this run will write under is settled above, so point the header
+    // at it. A --continue start is the one case with nothing to point at: the
+    // CLI picks the conversation itself and never tells the plugin which.
+    this.bindSessionHeader(cwd);
 
     // Get PATH from user's login shell (GUI apps don't inherit shell config)
     let shellEnv = { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" };
@@ -8101,16 +8256,17 @@ var TerminalView = class extends import_obsidian.ItemView {
 
     // User-defined environment variables (KEY=VALUE per line). Lets users set
     // things like CLAUDE_CONFIG_DIR to keep multiple Claude accounts separate.
-    const envVarsRaw = this.plugin.pluginData.claudeEnvVars || "";
-    for (const line of envVarsRaw.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eq = trimmed.indexOf("=");
-      if (eq <= 0) continue;
-      const key = trimmed.slice(0, eq).trim();
-      const val = trimmed.slice(eq + 1).trim();
-      if (key) shellEnv[key] = val;
-    }
+    // Parsed by flowEnvVars (session-header region) rather than here, so the
+    // shell and the header that watches its transcript resolve
+    // CLAUDE_CONFIG_DIR from one implementation. It also adds the two rules a
+    // synced settings file needs: [username] scoping and %USERPROFILE%.
+    Object.assign(
+      shellEnv,
+      flowEnvVars(this.plugin.pluginData.claudeEnvVars, {
+        user: flowCurrentUser(),
+        home: homeDir
+      })
+    );
 
     // WSL's PATH is inside the distro. A Windows filesystem probe would skip
     // launch for a CLI that is installed in Linux.
@@ -8295,6 +8451,8 @@ var TerminalView = class extends import_obsidian.ItemView {
       document.removeEventListener("paste", this.imagePasteHandler, true);
       this.imagePasteHandler = null;
     }
+    this.unwatchSessionHeader();
+    this.headerFile = null;
     if (this.fileDragOverHandler && this.termHost) {
       this.termHost.removeEventListener('dragover', this.fileDragOverHandler);
       this.fileDragOverHandler = null;
@@ -8978,6 +9136,183 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
     return true;
   }
 };
+
+// ===========================================================================
+// session header — BEGIN (fork addition; no upstream code in this region)
+//
+// A terminal tab says which CLI it is running and nothing about what it is
+// running on. With three sidebars open against one vault they are three
+// identical black rectangles, and telling them apart means scrolling a
+// transcript until something familiar goes past. Claude's own web UI names a
+// conversation at the top of it; this does the same for a tab.
+//
+// Everything drawn is read from the transcript Claude Code is already writing,
+// and nothing here asks the CLI for anything:
+//
+//   * `{"type":"ai-title","aiTitle":...}` — the name. Claude Code appends a
+//     fresh one whenever the subject of the session moves, so the header
+//     follows a session that turns into a different session.
+//   * `cwd` and `gitBranch` — carried on every message record.
+//
+// A session with no title record yet is drawn as untitled rather than as a
+// truncated id. An id standing where a name belongs reads as a name and is not
+// one, which is the same defect `title_source` exists to catch in the run-graph
+// pane; the id has its own place on the second line.
+//
+// The read is incremental. A transcript is append-only and reaches tens of
+// megabytes, so re-reading one every two seconds across three tabs would be
+// the most expensive thing this plugin does. Each poll reads only the bytes
+// added since the last one and stops at the final newline inside them, so
+// neither a half-written record nor a multi-byte character is ever split
+// across two reads.
+// ===========================================================================
+
+// Claude Code names a project directory after the working directory a session
+// started in, replacing every character that is not a letter or a digit with a
+// hyphen: `C:\Users\koen\Vault` becomes `C--Users-koen-Vault`. Reproduced here
+// rather than looked up because there is nothing to look it up in — the
+// mapping is one-way and the CLI publishes no index of it.
+function flowProjectSlug(cwd) {
+  return String(cwd || "").replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+function flowTranscriptPath(configDir, cwd, sessionId) {
+  // All three are required and any of them can legitimately be missing: a tab
+  // running a non-Claude backend claims no session id, and a session started
+  // with --continue adopts an id this plugin never sees. Returning null is how
+  // the header says "there is nothing to watch", which is not an error.
+  if (!configDir || !cwd || !sessionId) return null;
+  return path.join(configDir, "projects", flowProjectSlug(cwd), sessionId + ".jsonl");
+}
+
+// The account this Obsidian is running as, used only to decide whether an
+// account-scoped settings line applies here.
+function flowCurrentUser() {
+  return process.env.USERNAME || process.env.USER || "";
+}
+
+// Two machines read one settings file: `data.json` lives in the vault and the
+// vault syncs, so a literal path written into it is correct on at most one of
+// them. That is not hypothetical — it is the failure recorded in the personal
+// vault's `.system/Decisions/2026-08-09-claude-sidebar-config-dir.md`, where a
+// hardcoded CLAUDE_CONFIG_DIR pointed the second machine at a directory that
+// could not exist there and made every session ask for a fresh login.
+//
+// Two rules, both additive. A line with no prefix and no token behaves exactly
+// as upstream's `shellEnv[key] = val` did:
+//
+//   [username] KEY=VALUE   applies only on that account, absent on every other
+//   %USERPROFILE% or ~     expand to this machine's home directory
+//
+// An account-scoped line is *absent* elsewhere rather than empty, so the other
+// machine falls back to whatever it already has instead of to a value that
+// describes a machine it is not.
+function flowEnvVars(raw, options) {
+  const opts = options || {};
+  const user = String(opts.user || "").toLowerCase();
+  const home = opts.home || "";
+  const out = {};
+  for (const line of String(raw || "").split("\n")) {
+    let trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const scoped = trimmed.match(/^\[([^\]]+)\]\s*(.*)$/);
+    if (scoped) {
+      if (scoped[1].trim().toLowerCase() !== user) continue;
+      trimmed = scoped[2].trim();
+      if (!trimmed) continue;
+    }
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let val = trimmed.slice(eq + 1).trim();
+    if (!key) continue;
+    if (home) {
+      val = val.replace(/%USERPROFILE%/gi, home).replace(/^~(?=[\\/]|$)/, home);
+    }
+    out[key] = val;
+  }
+  return out;
+}
+
+// Where Claude Code keeps its transcripts. Resolved from the same parsed env
+// block the shell is launched with rather than from a second reading of the
+// setting: a header that resolved this differently from the process writing the
+// file would quietly name a different conversation, and would look right doing
+// it.
+function flowConfigDir(envVars, options) {
+  const opts = options || {};
+  const home = opts.home || "";
+  const processEnv = opts.processEnv || {};
+  const chosen =
+    (envVars && envVars.CLAUDE_CONFIG_DIR) ||
+    processEnv.CLAUDE_CONFIG_DIR ||
+    (home ? path.join(home, ".claude") : "");
+  return chosen || null;
+}
+
+function flowParseRecord(line) {
+  try {
+    return JSON.parse(line);
+  } catch (_) {
+    return null;
+  }
+}
+
+// The three field names worth reading a line for, as they appear in the file.
+// Named rather than inlined so the substring test and the property it stands in
+// for cannot drift apart silently.
+var FLOW_TITLE_MARK = '"ai-title"';
+var FLOW_BRANCH_MARK = '"gitBranch"';
+var FLOW_CWD_MARK = '"cwd"';
+
+// One pass over whatever the transcript has gained since the last one. Every
+// field is last-wins, which is what the file means: Claude Code appends a new
+// `ai-title` when it renames a session rather than correcting the old one, and
+// a cwd or a branch can legitimately change mid-session.
+//
+// The substring tests are not an optimisation detail, they are the reason this
+// is safe to run on the UI thread. A transcript is overwhelmingly message text;
+// JSON.parse over every line of tens of megabytes of it would stall Obsidian on
+// the first render. A line that merely mentions "ai-title" — this very
+// conversation's transcript is full of them — is parsed and then rejected on
+// its type, which is why that check is not redundant with the test that
+// selected the line.
+function flowScanHeader(text, state) {
+  const next = {
+    title: state ? state.title : null,
+    cwd: state ? state.cwd : null,
+    branch: state ? state.branch : null
+  };
+  let lastMeta = null;
+  for (const line of String(text || "").split("\n")) {
+    if (!line) continue;
+    if (line.indexOf(FLOW_TITLE_MARK) !== -1) {
+      const record = flowParseRecord(line);
+      if (record && record.type === "ai-title" && typeof record.aiTitle === "string") {
+        const title = record.aiTitle.trim().replace(/\s+/g, " ");
+        if (title) next.title = title;
+      }
+      continue;
+    }
+    if (line.indexOf(FLOW_BRANCH_MARK) !== -1 || line.indexOf(FLOW_CWD_MARK) !== -1) lastMeta = line;
+  }
+  // Only the last such line is parsed. The values are identical across a run of
+  // them, and parsing every one would undo the point of the tests above.
+  if (lastMeta) {
+    const record = flowParseRecord(lastMeta);
+    if (record) {
+      if (typeof record.cwd === "string" && record.cwd) next.cwd = record.cwd;
+      if (typeof record.gitBranch === "string" && record.gitBranch) next.branch = record.gitBranch;
+    }
+  }
+  return next;
+}
+
+function flowHeaderEqual(a, b) {
+  return a.title === b.title && a.cwd === b.cwd && a.branch === b.branch;
+}
+
+// ===== session header — END =====
 
 // ===========================================================================
 // proj-flow run-graph view — BEGIN (fork addition; no upstream code below)
