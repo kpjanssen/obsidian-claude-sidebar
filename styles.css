@@ -28,6 +28,72 @@
 	overflow: hidden;
 }
 
+/* --- the session header -------------------------------------------------- */
+
+/* What this tab is called, above everything else in the view. Sized to cost the
+ * terminal as little height as a name can: two lines at most, and the second of
+ * them smaller than the first. */
+.flow-session-header {
+	flex: 0 0 auto;
+	min-width: 0;
+	padding: 8px 12px 6px 12px;
+	background-color: var(--background-secondary);
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.flow-session-title {
+	font-size: var(--font-ui-small);
+	font-weight: var(--font-semibold);
+	line-height: 1.3;
+	color: var(--text-normal);
+	/* A sidebar is narrow and some titles are long. Clamped to two lines, with
+	 * the whole title on the tooltip, rather than allowed to push the terminal
+	 * further down the further a session wanders from what it started as. */
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+
+/* Untitled is a state, not a name, and is drawn as one. */
+.flow-session-title.is-untitled {
+	font-weight: var(--font-normal);
+	font-style: italic;
+	color: var(--text-faint);
+}
+
+.flow-session-meta {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 4px;
+	min-width: 0;
+	margin-top: 2px;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+}
+
+.flow-session-sep {
+	color: var(--text-faint);
+}
+
+.flow-session-branch,
+.flow-session-id {
+	font-family: var(--font-monospace);
+}
+
+.flow-session-id {
+	color: var(--text-faint);
+}
+
+.flow-session-id.is-copyable {
+	cursor: pointer;
+}
+
+.flow-session-id.is-copyable:hover {
+	color: var(--text-normal);
+}
+
 /* --- the two surfaces of one view (task 8.5) ---------------------------- */
 
 .flow-view-tabs {

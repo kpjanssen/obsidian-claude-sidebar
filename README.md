@@ -14,6 +14,7 @@ Built by [Derek Larson](https://dtlarson.com) - [Pairs with Delegate commands �
 - **Folder & file context menu** - Right-click any folder to open your agent in that directory, or a file to send it the path
 - **YOLO mode** - Launch your agent with YOLO mode via right-click menus
 - **Multi-backend** - Switch between Claude Code, Codex, Grok Build, OpenCode, Antigravity CLI, Kimi Code, GitHub Copilot, Cursor Agent, and Pi in settings, or via **Switch CLI provider…** in the command palette
+- **Session header** - Each tab is named by the title Claude Code gives the conversation, with its working directory, git branch and session id underneath. Read live from the transcript, so a session that turns into a different session renames itself
 
 ## Requirements
 
@@ -91,6 +92,57 @@ https://github.com/user-attachments/assets/de98439a-8a1f-4a8a-9d02-44027d756462
   - **Send file path to agent** / **Send selection to agent**
 - Press `Shift+Enter` for multi-line input
 - Set your own hotkeys in Settings → Hotkeys
+
+## The session header (fork)
+
+Three sidebar tabs open against one vault are three identical black rectangles.
+Working out which is which means scrolling a transcript until something familiar
+goes past, which is the problem this header exists to remove.
+
+It shows what Claude Code already knows and writes down:
+
+| line | source | absent when |
+|---|---|---|
+| the title | the last `{"type":"ai-title"}` record in the transcript | Claude has not named the session yet, drawn as *Untitled session* |
+| the project | the transcript's own `cwd`, falling back to this tab's working directory | never |
+| the branch | `gitBranch`, carried on every message record | the working directory is not a git repository |
+| the session id | the id this tab claimed at launch, first eight characters, click to copy | the backend is not Claude Code, or the session was started with `--continue` |
+
+Nothing is asked of the CLI and nothing is inferred. The title is Claude's own,
+rewritten as a session's subject moves, so the header follows a session that
+turns into a different session rather than pinning it to whatever it was first
+asked. A session with no title yet is drawn as untitled rather than as a
+truncated id -- an id standing where a name belongs reads as a name and is not
+one.
+
+The transcript is polled every two seconds and read incrementally: each poll
+reads only the bytes added since the last one, and stops at the final newline
+inside them, so neither a half-written record nor a multi-byte character is ever
+split across two reads. On this machine's transcripts -- up to 8.4 MB -- a
+4 KB-window replay produces byte-identical results to reading the whole file.
+
+`test/flow-header.test.js` covers the path mapping, the env-var rules below, and
+the scanner, including the one trap that matters: a message that merely quotes
+`"ai-title"` is not a title.
+
+### Environment variables in a synced settings file
+
+The header resolves `CLAUDE_CONFIG_DIR` from the same parsed env block the shell
+is launched with, because a header that resolved it differently would quietly
+name a different conversation and look right doing it. That parser adds two
+rules to upstream's `KEY=VALUE`, both additive -- a line with no prefix and no
+token behaves exactly as before:
+
+```
+[username] KEY=VALUE   applies only on that Windows account
+%USERPROFILE% or ~     expand to this machine's home directory
+```
+
+A vault that syncs between machines is read by both of them, so a literal path
+written into `data.json` is correct on at most one. An account-scoped line is
+*absent* on every other account rather than empty, so the other machine falls
+back to what it already has instead of to a value describing a machine it is
+not.
 
 ## Platform Support
 
