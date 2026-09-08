@@ -154,6 +154,41 @@ class TheTwoFileSetsAreDisjoint(unittest.TestCase):
             self.assertIn(verdict, ud.VERDICT_MEANING)
 
 
+class ReadingCherryPickProvenance(unittest.TestCase):
+    """A cherry-pick does not move the merge-base, so adoption needs a record."""
+
+    # The message git actually wrote when 1.10.1 was adopted on 2026-09-08.
+    REAL_MESSAGE = (
+        "1.10.1: light mode contrast and terminal scrollbar\n"
+        "\n"
+        "Light mode uses a light ANSI palette so option prompts are readable (#105).\n"
+        "\n"
+        "(cherry picked from commit 2f23380e346b9b5a8abfccf14217b7e88ba1ab5d)\n"
+    )
+
+    def test_finds_the_adopted_sha(self):
+        self.assertEqual(
+            ud.CHERRY_PICK_TRAILER.findall(self.REAL_MESSAGE),
+            ["2f23380e346b9b5a8abfccf14217b7e88ba1ab5d"],
+        )
+
+    def test_finds_several_across_concatenated_messages(self):
+        """`git log --format=%B` runs messages together; each trailer still counts."""
+        second = "\nsomething else\n\n(cherry picked from commit %s)\n" % ("a" * 40)
+        self.assertEqual(len(ud.CHERRY_PICK_TRAILER.findall(self.REAL_MESSAGE + second)), 2)
+
+    def test_a_message_merely_mentioning_a_sha_is_not_a_trailer(self):
+        """Prose about a commit is not a claim to have taken it."""
+        prose = "Looked at 2f23380e346b9b5a8abfccf14217b7e88ba1ab5d and decided against it."
+        self.assertEqual(ud.CHERRY_PICK_TRAILER.findall(prose), [])
+
+    def test_an_abbreviated_sha_is_not_matched(self):
+        """The trailer git writes is always full length; a short one is something else."""
+        self.assertEqual(
+            ud.CHERRY_PICK_TRAILER.findall("(cherry picked from commit 2f23380)"), []
+        )
+
+
 class TheReport(unittest.TestCase):
     def test_nothing_pending_says_so_rather_than_printing_an_empty_list(self):
         text = ud.format_report(
@@ -180,6 +215,28 @@ class TheReport(unittest.TestCase):
              "recorded_base": "96541d3", "record_matches": True, "commits": []}
         )
         self.assertNotIn("UPSTREAM.md records", text)
+
+    def test_an_adopted_commit_is_named_rather_than_dropped(self):
+        """Silently hiding it would answer the wrong question.
+
+        Upstream stays ahead after an adoption, because a cherry-pick does not
+        share history. Saying "already adopted" is what stops that looking like
+        the tool having missed something.
+        """
+        text = ud.format_report(
+            {"ref": "upstream/main", "base": "96541d3" + "0" * 33,
+             "recorded_base": "96541d3", "record_matches": True, "commits": [],
+             "adopted": [{"short": "2f23380", "subject": "light mode contrast"}]}
+        )
+        self.assertIn("already adopted: 2f23380", text)
+        self.assertIn("light mode contrast", text)
+
+    def test_a_report_without_an_adopted_key_still_formats(self):
+        """`adopted` is read with .get, so an older survey dict does not crash it."""
+        ud.format_report(
+            {"ref": "upstream/main", "base": "a" * 40,
+             "recorded_base": None, "record_matches": False, "commits": []}
+        )
 
     def test_a_commit_prints_its_verdict_and_its_files(self):
         text = ud.format_report(
