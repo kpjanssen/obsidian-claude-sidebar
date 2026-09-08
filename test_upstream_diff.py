@@ -63,6 +63,42 @@ class ParsingMergeTreeOutput(unittest.TestCase):
             ud.parse_merge_tree("")
 
 
+class MeasuringConflictSize(unittest.TestCase):
+    """Hunks say how many places; lines say how much. Both, because one lies."""
+
+    BLOB = (
+        "kept line\n"
+        "<<<<<<< HEAD\n"
+        "ours one\n"
+        "ours two\n"
+        "=======\n"
+        "theirs one\n"
+        ">>>>>>> abc1234\n"
+        "kept line\n"
+    )
+
+    def test_counts_hunks(self):
+        self.assertEqual(ud.measure_conflicts(self.BLOB)["hunks"], 1)
+
+    def test_counts_only_lines_inside_the_markers(self):
+        """Three: two ours, one theirs. The markers and the separator are not content."""
+        self.assertEqual(ud.measure_conflicts(self.BLOB)["lines"], 3)
+
+    def test_a_clean_blob_measures_zero(self):
+        self.assertEqual(ud.measure_conflicts("a\nb\n"), {"hunks": 0, "lines": 0})
+
+    def test_hunks_alone_would_have_missed_the_2026_09_08_adoption(self):
+        """The case that motivated the second number.
+
+        Hand-porting upstream's PATH refactor took main.js from 36 conflicted
+        lines to 11 while the hunk count stayed at 2. A report keyed on hunks
+        alone said the adoption had changed nothing.
+        """
+        before, after = {"hunks": 2, "lines": 36}, {"hunks": 2, "lines": 11}
+        self.assertEqual(before["hunks"], after["hunks"])
+        self.assertLess(after["lines"], before["lines"])
+
+
 class ClassifyingACommit(unittest.TestCase):
     """The judgement: what does a conflict in *this* file mean."""
 
@@ -101,6 +137,21 @@ class ClassifyingACommit(unittest.TestCase):
         verdict, rows = ud.classify(["src/new-thing.ts"], {"src/new-thing.ts": 3})
         self.assertEqual(verdict, ud.VERDICT_DECIDE)
         self.assertEqual(rows[0]["relation"], "untouched")
+
+    def test_the_richer_conflict_shape_is_accepted(self):
+        """merge_probe hands classify a dict; older callers hand it an int.
+
+        Both are read the same way, so adding the line count did not have to
+        touch every caller or every fixture at once.
+        """
+        _, rows = ud.classify(["main.js"], {"main.js": {"hunks": 2, "lines": 11}})
+        self.assertEqual(rows[0]["hunks"], 2)
+        self.assertEqual(rows[0]["lines"], 11)
+
+    def test_a_bare_count_still_works_and_reports_no_size(self):
+        _, rows = ud.classify(["main.js"], {"main.js": 2})
+        self.assertEqual(rows[0]["hunks"], 2)
+        self.assertEqual(rows[0]["lines"], 0)
 
     def test_hunk_counts_are_carried_through(self):
         _, rows = ud.classify(["main.js"], {"main.js": 2})
