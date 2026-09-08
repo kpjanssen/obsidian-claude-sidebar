@@ -235,10 +235,18 @@ python upstream_diff.py --json
 ```
 
 Exit status is 0 when nothing is pending, 2 when something wants a look, and 1
-when the question could not be answered. It also compares
-`git merge-base HEAD upstream/main` against the commit `UPSTREAM.md` records
-and reports the drift, since a stale record makes every number below it wrong.
-Tests: `python -m unittest test_upstream_diff`.
+when the question could not be answered. Tests:
+`python -m unittest test_upstream_diff`.
+
+**Adopting one.** `git cherry-pick -x <sha>`, resolve the replaced files by
+hand, `git cherry-pick --continue`. The `-x` matters: it writes
+`(cherry picked from commit <sha>)` into the message, and that trailer is how
+`upstream_diff.py` knows the commit is taken. Without it the commit is reported
+as pending forever, because a cherry-pick does not move the merge-base — it
+creates a new commit here rather than sharing history. Adopted commits are
+listed as adopted rather than hidden, so upstream still being ahead does not
+read as the tool having missed something. `UPSTREAM.md` records what each port
+had to change.
 
 ## Contributing
 

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -154,6 +155,32 @@ def recorded_base():
         # _recorded exits when the record names no commit. That is a missing
         # record, not a broken tool, and the survey still has something to say.
         return None
+
+
+#: `git cherry-pick -x` writes this into the message of the commit it creates.
+CHERRY_PICK_TRAILER = re.compile(r"cherry picked from commit ([0-9a-f]{40})")
+
+
+def adopted_shas(base):
+    """Upstream commits this fork has already taken, read from git's own trailers.
+
+    A cherry-pick does not move the merge-base -- it creates a new commit on
+    this side rather than sharing history -- so without this the tool reports
+    an adopted commit as pending forever, and the report degrades into
+    something you learn to ignore.
+
+    The record is `git cherry-pick -x`'s own "(cherry picked from commit
+    <sha>)" line, so it is written by the act of adopting rather than
+    remembered afterwards. A hand-kept list in a markdown file would be a
+    second place to forget.
+
+    The tempting alternative is `git log --cherry-pick`, which matches by
+    patch-id. It does not work here: every adoption resolves conflicts in the
+    files this fork replaced, so the patch that landed is not the patch
+    upstream wrote and its id differs. It would report every adopted commit as
+    still pending, and it would do so silently.
+    """
+    return set(CHERRY_PICK_TRAILER.findall(git("log", "--format=%B", "%s..HEAD" % base)))
 
 
 def pending_commits(base, ref):
@@ -273,9 +300,17 @@ def survey(fetch=True):
         "base": base,
         "recorded_base": recorded,
         "record_matches": recorded is not None and base.startswith(recorded[:7]),
+        "adopted": [],
         "commits": [],
     }
+    taken = adopted_shas(base)
     for commit in pending_commits(base, ref):
+        if commit["sha"] in taken:
+            # Listed rather than dropped. "Already taken" and "never existed"
+            # are different facts, and the first one is the answer to "why is
+            # upstream still ahead of us".
+            result["adopted"].append(commit)
+            continue
         conflicts = merge_probe(commit["sha"])
         verdict, rows = classify(touched_files(commit["sha"]), conflicts)
         commit["verdict"] = verdict
@@ -293,6 +328,8 @@ def format_report(result):
             "upstream diff: %d commit(s) on %s since %s"
             % (len(result["commits"]), result["ref"], result["base"][:7])
         )
+    for commit in result.get("adopted", []):
+        lines.append("  already adopted: %s  %s" % (commit["short"], commit["subject"]))
     if result["recorded_base"] and not result["record_matches"]:
         lines.append(
             "  UPSTREAM.md records %s, but this fork actually diverged at %s. "
