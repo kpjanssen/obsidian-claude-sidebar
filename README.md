@@ -211,6 +211,35 @@ An unreachable GitHub is reported as unavailable, never silently treated as
 python upstream_check.py
 ```
 
+**Deciding whether to take what upstream did.** `upstream_check.py` answers
+whether upstream moved; `upstream_diff.py` answers whether this fork can take
+it. For each pending commit it computes the merge with
+`git merge-tree --write-tree` — which produces a tree and a conflict list
+without touching the working tree, the index or any branch — and grades the
+result per file:
+
+| relation | meaning | a conflict here |
+|---|---|---|
+| **extended** | `main.js`, upstream's plugin with the fork's view added | the real cost; needs a decision |
+| **replaced** | `manifest.json`, `styles.css`, `README.md`, `install.sh`, `.gitignore` — rewritten by the fork | expected on every release; informational |
+| **untouched** | the fork has never changed it | applies cleanly |
+
+That distinction is the point. Grading a `manifest.json` collision as a
+blocker would cry wolf on literally every upstream commit, because the fork
+carries its own id and name there by design.
+
+```bash
+python upstream_diff.py              # the report
+python upstream_diff.py --show <sha> # what upstream actually changed in main.js
+python upstream_diff.py --json
+```
+
+Exit status is 0 when nothing is pending, 2 when something wants a look, and 1
+when the question could not be answered. It also compares
+`git merge-base HEAD upstream/main` against the commit `UPSTREAM.md` records
+and reports the drift, since a stale record makes every number below it wrong.
+Tests: `python -m unittest test_upstream_diff`.
+
 ## Contributing
 
 Hit a bug or want to develop a new feature? Point your coding agent at `CLAUDE.md` in this repo. It will walk you through diagnosis, filing a report, or opening a PR.
