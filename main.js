@@ -8246,33 +8246,12 @@ var TerminalView = class extends import_obsidian.ItemView {
         delete shellEnv[pathKey];
       }
     }
-    if (!isWindows) {
-      try {
-        const shellOutput = (0, import_child_process.execSync)(
-          `${shell} -lic 'echo "__PATH__"; echo "$PATH"'`,
-          { encoding: 'utf8', timeout: 5000 }
-        );
-        // Extract PATH from after the marker (shell integration escapes pollute early output)
-        const shellPath = shellOutput.split('__PATH__\n')[1]?.trim().split('\n')[0];
-        if (shellPath) {
-          shellEnv.PATH = shellPath;
-        }
-      } catch (e) {
-        // Fall back to process.env.PATH if shell init fails
-        console.warn('[Flow Terminal] PATH detection timed out — falling back to system PATH. If tools are missing, check your shell startup time.');
-      }
-    } else {
-      try {
-        const psOut = (0, import_child_process.execSync)(
-          `powershell.exe -NoProfile -NonInteractive -Command "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"`,
-          { encoding: "utf8", timeout: 5000, windowsHide: true }
-        );
-        const freshPath = psOut.trim();
-        if (freshPath) shellEnv.PATH = freshPath;
-      } catch (e) {
-        console.warn("[Flow Terminal] Windows PATH refresh failed — falling back to process PATH.");
-      }
-    }
+    // Adopted from upstream 1.10.0 (6a31bae) for the caching alone: this
+    // probe costs a login-shell startup and used to run once per terminal.
+    // The rest of that commit -- a picker that opens an agent in any folder
+    // on the machine -- is deliberately not taken; see UPSTREAM.md.
+    const userPath = this.plugin.resolveUserPath();
+    if (userPath) shellEnv.PATH = userPath;
     // Ensure backend-specific paths are available
     for (const hint of pathHints) {
       if (hint && shellEnv.PATH && !shellEnv.PATH.includes(hint)) {
@@ -9056,6 +9035,41 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
   }
   getDefaultBackend() {
     return CLI_BACKENDS[this.pluginData.cliBackend] || CLI_BACKENDS.claude;
+  }
+  // GUI apps don't inherit shell config, so process.env.PATH misses most CLIs.
+  // The same login-shell probe the launcher uses, cached for the session
+  // because it costs a shell startup. Upstream 1.10.0 verbatim apart from the
+  // warning label; the probe itself came from upstream 1.9.5 and this fork
+  // only ever rebranded it, which is why the conflict was cosmetic.
+  resolveUserPath() {
+    if (this._cachedUserPath !== void 0) return this._cachedUserPath;
+    // process.env is case-insensitive on Windows but Object.keys is not --
+    // Windows spells it "Path", so a plain process.env.PATH reads undefined.
+    const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === "PATH");
+    let resolved = pathKey ? process.env[pathKey] : "";
+    try {
+      if (process.platform === "win32") {
+        const psOut = (0, import_child_process.execSync)(
+          `powershell.exe -NoProfile -NonInteractive -Command "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"`,
+          { encoding: "utf8", timeout: 5000, windowsHide: true }
+        );
+        const freshPath = psOut.trim();
+        if (freshPath) resolved = freshPath;
+      } else {
+        const shell = this.resolveShell().binary;
+        const out = (0, import_child_process.execSync)(
+          `${shell} -lic 'echo "__PATH__"; echo "$PATH"'`,
+          { encoding: "utf8", timeout: 5000 }
+        );
+        // Shell integration escapes pollute the early output, so read after the marker.
+        const shellPath = out.split("__PATH__\n")[1]?.trim().split("\n")[0];
+        if (shellPath) resolved = shellPath;
+      }
+    } catch (_) {
+      console.warn("[Flow Terminal] PATH detection timed out — falling back to system PATH. If tools are missing, check your shell startup time.");
+    }
+    this._cachedUserPath = resolved;
+    return resolved;
   }
   // Labels built at display time (ribbon, context menus) name the actual
   // provider. Command names can't — they're registered once at load — so those
