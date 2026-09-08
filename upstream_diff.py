@@ -243,12 +243,42 @@ def merge_probe(sha):
     counts = {}
     for path in conflicted:
         blob = git("cat-file", "blob", "%s:%s" % (tree, path), check=False)
-        counts[path] = sum(1 for line in blob.splitlines() if line.startswith("<<<<<<<"))
+        counts[path] = measure_conflicts(blob)
     return counts
+
+
+def measure_conflicts(blob):
+    """``{"hunks": n, "lines": n}`` for one merged blob.
+
+    Hunks alone lose resolution exactly when it matters. Adopting upstream's
+    PATH refactor by hand on 2026-09-08 took the `main.js` collision from
+    twenty-six divergent lines down to four -- a comment -- and the hunk count
+    stayed at two, so the report said nothing had changed. Both numbers are
+    kept because they answer different questions: how many places, and how much.
+    """
+    hunks, lines, inside = 0, 0, False
+    for line in blob.splitlines():
+        if line.startswith("<<<<<<<"):
+            hunks += 1
+            inside = True
+        elif line.startswith(">>>>>>>"):
+            inside = False
+        elif line.startswith("======="):
+            pass  # the separator is not content on either side
+        elif inside:
+            lines += 1
+    return {"hunks": hunks, "lines": lines}
 
 
 def touched_files(sha):
     return [p for p in git("diff", "--name-only", "%s^" % sha, sha).splitlines() if p.strip()]
+
+
+def _conflict_size(value):
+    """Accept a bare hunk count or a measure_conflicts dict, uniformly."""
+    if isinstance(value, dict):
+        return value.get("hunks", 0), value.get("lines", 0)
+    return value, 0
 
 
 def classify(files, conflicts):
@@ -261,7 +291,7 @@ def classify(files, conflicts):
     """
     rows = []
     for path in sorted(set(files) | set(conflicts)):
-        hunks = conflicts.get(path, 0)
+        hunks, conflicted_lines = _conflict_size(conflicts.get(path, 0))
         conflicted = path in conflicts
         if path in REPLACED:
             relation, note = "replaced", "the fork owns this file outright"
@@ -276,6 +306,7 @@ def classify(files, conflicts):
                 "note": note,
                 "conflicted": conflicted,
                 "hunks": hunks,
+                "lines": conflicted_lines,
             }
         )
 
@@ -341,8 +372,11 @@ def format_report(result):
         lines.append("%s  %s  %s" % (commit["short"], commit["date"], commit["subject"]))
         lines.append("  %s -- %s" % (commit["verdict"].upper(), VERDICT_MEANING[commit["verdict"]]))
         for row in commit["files"]:
-            state = ("conflict x%d" % row["hunks"]) if row["conflicted"] else "merges"
-            lines.append("    %-24s %-13s %s (%s)" % (row["path"], state, row["relation"], row["note"]))
+            if row["conflicted"]:
+                state = "conflict x%d, %dL" % (row["hunks"], row.get("lines", 0))
+            else:
+                state = "merges"
+            lines.append("    %-24s %-17s %s (%s)" % (row["path"], state, row["relation"], row["note"]))
     if result["commits"]:
         lines.append("")
         lines.append("Read one with:  python upstream_diff.py --show <sha>")
