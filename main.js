@@ -8128,6 +8128,18 @@ var TerminalView = class extends import_obsidian.ItemView {
     const vaultPath = this.plugin.getVaultPath();
     const resolvedDefault = defaultDir ? path.resolve(vaultPath, defaultDir) : vaultPath;
     const cwd = workingDir || resolvedDefault;
+    const boundary = flowWorkVaultProblem(cwd);
+    if (boundary) {
+      // Every start and every resume passes through here, so this is the one
+      // place the check has to be. Nothing is persisted: `lastCwd` is what a
+      // resume replays, so recording a refused directory would re-fire the
+      // refusal on every restart and would leave the path in a settings file
+      // that syncs to the other machine.
+      this.term?.writeln("");
+      this.term?.writeln(boundary);
+      this.term?.writeln("");
+      return;
+    }
     // Persist last working directory for resume
     this.plugin.pluginData.lastCwd = cwd;
     this.plugin.saveData(this.plugin.pluginData);
@@ -10059,6 +10071,36 @@ var FLOW_WORK_ROOT_MARKER = "onedrive - ";
 //
 // Absent stays absent: a plan and a trigger inventory record no profile because
 // they were not extracted from one, and nothing is asserted about them.
+// A terminal is a launch, and a launch inside a professional vault crosses the
+// cross-vault boundary by the most direct route available: an agent with a
+// shell, sitting in work content. `flowProfileProblem` below cannot see this --
+// it checks which profile a run graph was *extracted* from, which is a fact
+// about a document that already exists. Nothing was checking where a terminal
+// was about to start.
+//
+// Upstream 1.10.0's project picker is what made the gap worth closing: it opens
+// an agent in any folder on the machine and keeps it in a recents list. The
+// guard is deliberately independent of whether that commit is ever adopted,
+// because the gap is already reachable through `defaultWorkingDir` and through
+// a `lastCwd` restored from a settings file that syncs between machines.
+//
+// Same marker and the same reasoning about absolute paths as the profile check:
+// a path segment beginning "onedrive - " is a OneDrive-for-Business root, which
+// identifies the shape without naming an employer and without storing a path
+// that would be wrong on the other machine.
+function flowWorkVaultProblem(dir) {
+  if (!dir) return null;
+  const segments = String(dir).split(/[\\/]+/).filter(Boolean);
+  for (let i = 0; i < segments.length; i++) {
+    if (segments[i].toLowerCase().indexOf(FLOW_WORK_ROOT_MARKER) === 0) {
+      return "Refusing to start a terminal in " + segments[i] +
+        ". That is a professional vault, and the cross-vault boundary is not " +
+        "overridable from here. Start a session in that vault instead.";
+    }
+  }
+  return null;
+}
+
 function flowProfileProblem(recorded) {
   if (!recorded) return null;
   const segments = String(recorded).split(/[\\/]+/).filter(Boolean);

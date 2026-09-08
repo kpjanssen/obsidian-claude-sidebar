@@ -144,6 +144,27 @@ written into `data.json` is correct on at most one. An account-scoped line is
 back to what it already has instead of to a value describing a machine it is
 not.
 
+## The cross-vault boundary (fork)
+
+This fork runs in a personal vault that sits beside a professional one, and it
+refuses to cross between them. Two independent checks, because they catch
+different things:
+
+- **Documents.** A run graph records the profile it was extracted from. One
+  naming a profile inside a professional vault is refused rather than drawn,
+  so its titles and paths never reach this pane.
+- **Terminals.** `startShell` refuses a working directory whose path contains
+  a OneDrive-for-Business segment. That is the single point every start and
+  every resume passes through, and nothing is persisted when it refuses —
+  `lastCwd` is what a resume replays, so recording a refused directory would
+  re-fire the refusal forever and put the path in a synced settings file.
+
+Both match the *shape* of a work root — a path segment beginning
+`onedrive - ` — rather than one organisation's name, and neither stores an
+absolute path, which would be wrong on the other machine. There is no setting
+to turn either off; that is the point of a boundary rather than a preference.
+Tests: `node test/flow-launch.test.js` and `node test/flow-face.test.js`.
+
 ## Platform Support
 
 | Platform | Status |
