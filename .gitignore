@@ -4,3 +4,7 @@ node_modules/
 .claude/
 .vs
 CLAUDE.local.md
+
+# python bytecode, from upstream_check.py / upstream_diff.py
+__pycache__/
+*.pyc
