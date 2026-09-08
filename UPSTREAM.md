@@ -42,6 +42,15 @@ colliding with an upstream refactor, and neither is a design disagreement:
   inserted `open-agent-in-project` next to `new-tab-with-cli-provider`, so the
   hunk lands mid-list. Take both, prefix both.
 
+**Partially adopted, 2026-09-08: the refactor without the feature.** The two
+are separable, so `resolveUserPath()` was hand-ported onto the plugin with the
+`[Flow Terminal]` label and the call site reduced to two lines. The gain is the
+cache: a login-shell probe is the expensive part and it used to run once per
+terminal. This was **not** a `cherry-pick -x`, and deliberately carries no
+`(cherry picked from commit 6a31bae)` trailer -- that trailer means the commit
+was taken, and most of it was not. `upstream_diff.py` therefore still reports
+`6a31bae` as pending, which is the honest answer.
+
 So the merge is mechanical. What is open is whether the feature is wanted: the
 command opens a CLI in **any folder on the machine**, browsed to and then
 remembered in a recents list, and this plugin has no launch-side boundary
