@@ -1,0 +1,2 @@
+# Git for Windows sh fails on a CRLF shebang; core.autocrlf is true here.
+.githooks/* text eol=lf
