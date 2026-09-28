@@ -1,0 +1,16 @@
+# Same commands as .githooks/pre-commit, run on every push and pull request.
+# Windows runner because the code is developed and run on Windows.
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: node --test "test/*.test.js"; if ($LASTEXITCODE) { exit 1 }; python -m unittest test_upstream_diff

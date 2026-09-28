@@ -1,0 +1,19 @@
+#!/bin/sh
+# Refuse a commit that breaks the test suite.
+#
+# Added 2026-09-28 from the AI-native SDLC gap analysis in the personal vault
+# (areas/agentic-setup/audits/ai-native-sdlc-gap-analysis-2026-09-28.md): the
+# suite existed but nothing ran it, so whether a change was tested depended on
+# the session remembering to. Same pattern as proj-finances/.githooks/pre-commit.
+# The whole suite runs because it is fast enough to; move to a subset if it
+# stops being so. The same commands run in .github/workflows/test.yml on push.
+#
+# Wired by `git config core.hooksPath .githooks`, which is per-clone. The vault's
+# SessionStart hook git_hooks_liveness.py repairs it when it is missing.
+
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+# Node 24 reads a bare directory as a module path, so node expands the glob.
+node --test "test/*.test.js" || exit 1
+python -m unittest -q test_upstream_diff || exit 1
