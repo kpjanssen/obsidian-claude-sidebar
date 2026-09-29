@@ -10033,9 +10033,11 @@ var FLOW_SUPPORTED_SCHEMA_VERSIONS = [1, 2];
 
 // The document kinds this pane can lay out, likewise closed. `run` is a record
 // of work that happened; `plan` is a definition of work that could happen;
-// `trigger-inventory` is what is scheduled against those definitions. Anything
-// else is refused by name rather than drawn on a guess.
-var FLOW_SUPPORTED_KINDS = ["run", "plan", "trigger-inventory"];
+// `trigger-inventory` is what is scheduled against those definitions; `join`
+// is a run graph joined read-only against the vault's knowledge graph
+// (docs/graph-schema.md § the join document). Anything else is refused by
+// name rather than drawn on a guess.
+var FLOW_SUPPORTED_KINDS = ["run", "plan", "trigger-inventory", "join"];
 
 // Version 1 predates `kind` and defined no document this pane could confuse
 // a run graph with -- docs/graph-schema.md: "A version-1 document is a run

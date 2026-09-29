@@ -224,7 +224,7 @@ check(
 
 equal(
   F.FLOW_SUPPORTED_KINDS.join(","),
-  "run,plan,trigger-inventory",
+  "run,plan,trigger-inventory,join",
   "the accepted set is the published one and nothing more"
 );
 
