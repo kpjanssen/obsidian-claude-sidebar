@@ -10371,12 +10371,68 @@ function flowResolveRepoPath(env, existsFn) {
 function flowResolvePythonCmd(platform, hasPyLauncher, wherePythonPaths) {
   if (platform !== "win32") return "python3";
   if (hasPyLauncher) return "py";
+  // A .bat or .cmd shim (pyenv-win) is never chosen: Node 18.20+/20.12+/21.7.3+
+  // refuses to spawn one without a shell (CVE-2024-27980, EINVAL), and this
+  // feature never shells. Only a real .exe qualifies; otherwise a bare python.
   const candidates = (wherePythonPaths || []).filter(Boolean);
-  const batShim = candidates.find((p) => p.toLowerCase().endsWith(".bat"));
-  if (batShim) return batShim;
-  if (candidates.length) return candidates[0];
+  const exe = candidates.find((p) => p.toLowerCase().endsWith(".exe"));
+  if (exe) return exe;
   return "python";
 }
+
+// Async replacement for the two execSync probes that used to run on the
+// renderer thread at every confirm. Resolved once and cached: the answer does
+// not change while Obsidian runs. `deps.execFile` and `deps.platform` are
+// injectable for tests. A failed probe resolves (never rejects).
+var flowPythonCmdPromise = null;
+function flowResetPythonCache() {
+  flowPythonCmdPromise = null;
+}
+function flowDetectPythonCmd(deps) {
+  if (flowPythonCmdPromise) return flowPythonCmdPromise;
+  const execFile = (deps && deps.execFile) || import_child_process.execFile;
+  const platform = (deps && deps.platform) || process.platform;
+  const probe = (file, args) =>
+    new Promise((resolve) => {
+      try {
+        execFile(file, args, { timeout: 2000, windowsHide: true, encoding: "utf8" }, (err, stdout) => {
+          resolve(err ? null : String(stdout || ""));
+        });
+      } catch (_err) {
+        resolve(null);
+      }
+    });
+  if (platform !== "win32") {
+    flowPythonCmdPromise = Promise.resolve(flowResolvePythonCmd(platform, false, []));
+    return flowPythonCmdPromise;
+  }
+  flowPythonCmdPromise = probe("py", ["--version"]).then((py) => {
+    if (py !== null) return flowResolvePythonCmd(platform, true, []);
+    return probe("where.exe", ["python"]).then((out) => {
+      const paths = (out || "")
+        .split(/\r?\n/)
+        .map((p) => p.trim())
+        .filter((p) => p && p.indexOf("WindowsApps") === -1);
+      return flowResolvePythonCmd(platform, false, paths);
+    });
+  });
+  return flowPythonCmdPromise;
+}
+
+// Launches whose flow process is still running, keyed action|origin|plan.
+// Module-level so it survives the pane being closed and reopened: the spawn
+// outlives the pane by design.
+var flowLaunchesInFlight = new Set();
+function flowLaunchKey(action, originNodeId, planName) {
+  return action + "|" + originNodeId + "|" + planName;
+}
+function flowLaunchInFlightFor(action, originNodeId) {
+  const prefix = action + "|" + originNodeId + "|";
+  for (const k of flowLaunchesInFlight) if (k.indexOf(prefix) === 0) return true;
+  return false;
+}
+
+var FLOW_COMPILE_TIMEOUT_MS = 120000;
 
 // The two-step spawn itself: compile, then launch, in that order, each
 // waited on before the next starts -- launch is never attempted after a
@@ -10393,7 +10449,8 @@ function flowRunAction(opts, deps) {
   const spawn = (deps && deps.spawn) || flowSpawnChild;
   const cwd = opts.flowRepoPath;
   const compileArgv = flowChildArgv("compile", opts);
-  return spawn(opts.pythonCmd, compileArgv, { cwd }).then((compiled) => {
+  const compileTimeout = opts.compileTimeoutMs || FLOW_COMPILE_TIMEOUT_MS;
+  return spawn(opts.pythonCmd, compileArgv, { cwd, timeoutMs: compileTimeout }).then((compiled) => {
     if (compiled.code !== 0) {
       return {
         ok: false,
@@ -10462,12 +10519,25 @@ function flowSpawnChild(cmd, argv, options) {
     }
     let stdout = "";
     let stderr = "";
+    let timer = null;
+    if (options.timeoutMs > 0) {
+      timer = setTimeout(() => {
+        try { child.kill(); } catch (_err) {}
+        resolve({
+          code: null,
+          stdout,
+          stderr: "timed out after " + Math.round(options.timeoutMs / 1000) + "s and was stopped" + (stderr ? ": " + stderr : "")
+        });
+      }, options.timeoutMs);
+    }
     if (child.stdout) child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
     if (child.stderr) child.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
     child.on("error", (error) => {
+      if (timer) clearTimeout(timer);
       resolve({ code: null, stdout, stderr: stderr || String((error && error.message) || error) });
     });
     child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
       resolve({ code, stdout, stderr });
     });
     if (options.detached) child.unref();
@@ -10591,6 +10661,9 @@ var FlowGraphPane = class {
     this.watchAvailable = false;
     this.watchTimer = null;
     this.destroyed = false;
+    // Refusals shown as launch_failed nodes, keyed by origin node id, and
+    // re-applied after every document replacement until dismissed.
+    this.pendingFailures = new Map();
     this.build();
   }
 
@@ -10692,6 +10765,7 @@ var FlowGraphPane = class {
     this.selectedFile = file;
     const read = flowReadDocument(file);
     this.document = read.document;
+    this._applyPendingFailures();
     this.documentError = read.error ? read.error.message : null;
     // task 3.3: checked on every selection, not only on first load, so that
     // watching a file change into an unsupported version or a non-run kind
@@ -11255,6 +11329,11 @@ var FlowGraphPane = class {
     row("span kind", node["openinference.span.kind"]);
     row("outcome", node.outcome);
     if (node.error) row("error", node.error);
+    if (node.kind === "launch_failed") {
+      const dismissRow = pane.createDiv({ cls: "flow-detail-actions" });
+      const originId = node["graph.node.parent_id"];
+      dismissRow.createEl("button", { text: "Dismiss" }).addEventListener("click", () => this.dismissFailure(originId));
+    }
     // These three are stated when present and stated as unrecorded when not,
     // because their absence is itself the finding this project measures.
     // A trigger has no description to be missing: the field does not apply to
@@ -11452,8 +11531,22 @@ var FlowGraphPane = class {
     }
   }
 
+  // What the fork dialog shows for a chosen plan. The dialog's options carry
+  // the plan's name (its sessionId), not its file, so the name is mapped to
+  // the file here before the document is read.
+  _describeForkPlan(plans, name) {
+    const plan = plans.find((p) => p.name === name);
+    if (!plan) return { model: null };
+    const read = flowReadDocument(plan.file);
+    return read.document ? flowPlanPreview(read.document) : { model: null };
+  }
+
   openLaunchDialog(action, node, repoPath, vaultPath) {
     const doc = this.document;
+    if (flowLaunchInFlightFor(action, node["graph.node.id"])) {
+      new import_obsidian.Notice("A launch from this node is already running. Nothing was started.");
+      return;
+    }
     if (action === FLOW_ACTION_LAUNCH) {
       const current = this.summaries.find((s) => s.file === this.selectedFile);
       const planName = current ? current.sessionId : null;
@@ -11488,18 +11581,19 @@ var FlowGraphPane = class {
     const plans = this.summaries.filter(
       (s) => (s.documentClass || "run") === "plan" && !s.unreadable && !s.refused
     );
+    const dialogPlans = plans.map((s) => ({ name: s.sessionId, file: s.file }));
+    // Every candidate's mtime is captured now, when the dialog opens, so the
+    // confirm-time re-check compares against what the operator was shown and
+    // not against a read taken a moment before the compare (task 1.4).
+    const snapshots = new Map(plans.map((s) => [s.sessionId, this._launchSnapshot(s.file)]));
     const modal = new (flowLaunchConfirmModalClass())(this.app, {
       action,
       resumeSessionId: doc.session_id,
       forkTitle: flowFace(node),
-      plans: plans.map((s) => ({ name: s.sessionId, file: s.file })),
+      plans: dialogPlans,
       vaultPath,
-      describePlan: (file) => {
-        const read = flowReadDocument(file);
-        return read.document ? flowPlanPreview(read.document) : { model: null };
-      },
+      describePlan: (name) => this._describeForkPlan(dialogPlans, name),
       onConfirm: (chosenPlanName) => {
-        const chosen = plans.find((s) => s.sessionId === chosenPlanName);
         this.confirmLaunch({
           action,
           repoPath,
@@ -11507,7 +11601,7 @@ var FlowGraphPane = class {
           planName: chosenPlanName,
           originNodeId: node["graph.node.id"],
           resumeSessionId: doc.session_id,
-          snapshot: this._launchSnapshot(chosen ? chosen.file : null)
+          snapshot: snapshots.get(chosenPlanName) || null
         });
       }
     });
@@ -11526,72 +11620,81 @@ var FlowGraphPane = class {
     const planSummary = this.summaries.find(
       (s) => (s.documentClass || "run") === "plan" && s.sessionId === params.planName
     );
+    if (!planSummary) {
+      new import_obsidian.Notice(
+        "This plan is no longer available since the dialog opened. Nothing was compiled or launched."
+      );
+      return Promise.resolve();
+    }
     const current = {
       nodePresent: !!(this.byId && this.byId.has(params.originNodeId)),
-      planFile: planSummary ? planSummary.file : null,
-      planMtimeMs: planSummary ? this._launchSnapshot(planSummary.file).planMtimeMs : null
+      planFile: planSummary.file,
+      planMtimeMs: this._launchSnapshot(planSummary.file).planMtimeMs
     };
     if (!flowTargetStillValid(params.snapshot, current)) {
       new import_obsidian.Notice(
         "This plan changed or is no longer available since the dialog opened. Nothing was compiled or launched."
       );
-      return;
+      return Promise.resolve();
     }
     // Re-checked immediately before spawning, on the same terms startShell
     // re-checks it before every terminal start -- belt and suspenders around
     // the one refusal that must never be skippable.
     if (flowWorkVaultProblem(params.vaultPath)) {
       new import_obsidian.Notice("Refusing: this vault is a professional vault. Nothing was started.");
-      return;
+      return Promise.resolve();
     }
-
-    let hasPy = false;
-    try {
-      import_child_process.execSync("py --version", { stdio: "ignore", timeout: 2000 });
-      hasPy = true;
-    } catch (_err) {}
-    let wherePaths = [];
-    if (!hasPy && process.platform === "win32") {
-      try {
-        const out = import_child_process.execSync("where.exe python", { encoding: "utf8", timeout: 2000 });
-        wherePaths = out
-          .split(/\r?\n/)
-          .map((p) => p.trim())
-          .filter((p) => p && p.indexOf("WindowsApps") === -1);
-      } catch (_err) {}
+    const key = flowLaunchKey(params.action, params.originNodeId, params.planName);
+    if (flowLaunchesInFlight.has(key)) {
+      new import_obsidian.Notice(params.planName + " is already running from this node. Nothing was started.");
+      return Promise.resolve();
     }
-    const pythonCmd = flowResolvePythonCmd(process.platform, hasPy, wherePaths);
+    flowLaunchesInFlight.add(key);
+    this.dismissFailure(params.originNodeId);
 
-    const opts = {
-      planName: params.planName,
-      vaultPath: params.vaultPath,
-      flowRepoPath: params.repoPath,
-      pythonCmd,
-      originNodeId: params.originNodeId,
-      resumeSessionId: params.resumeSessionId || null
-    };
+    const deps = params.deps || {};
     new import_obsidian.Notice(
-      (params.action === FLOW_ACTION_FORK ? "Forking " : "Launching ") + params.planName + "…"
+      (params.action === FLOW_ACTION_FORK ? "Forking " : "Launching ") + params.planName + "\u2026"
     );
-    flowRunAction(opts, {})
-      .then((result) => {
-        if (this.destroyed) return;
-        if (result.ok) {
+    // Notices are shown even when the pane is gone: the spawn outlives it by
+    // design, and a failure must never be swallowed. Only DOM and graph work
+    // is guarded on this.destroyed (injectFailureNode does that itself).
+    return Promise.resolve()
+      .then(() => (deps.pythonCmd ? deps.pythonCmd : flowDetectPythonCmd()))
+      .then((pythonCmd) =>
+        flowRunAction(
+          {
+            planName: params.planName,
+            vaultPath: params.vaultPath,
+            flowRepoPath: params.repoPath,
+            pythonCmd,
+            originNodeId: params.originNodeId,
+            resumeSessionId: params.resumeSessionId || null
+          },
+          deps.spawn ? { spawn: deps.spawn } : {}
+        )
+      )
+      .then(
+        (result) => {
+          if (result.ok) {
+            new import_obsidian.Notice(
+              "flow launch finished for " + params.planName + ". The graph updates once it renders."
+            );
+            return;
+          }
           new import_obsidian.Notice(
-            "flow launch finished for " + params.planName + ". The graph updates once it renders."
+            "flow " + result.stage + " refused " + params.planName + ": " + flowClip(result.message, 180)
           );
-          return;
+          this.injectFailureNode(params.originNodeId, params.action, result.message);
+        },
+        (error) => {
+          new import_obsidian.Notice(
+            "Launching " + params.planName + " failed unexpectedly: " + ((error && error.message) || error)
+          );
         }
-        new import_obsidian.Notice(
-          "flow " + result.stage + " refused " + params.planName + ": " + flowClip(result.message, 180)
-        );
-        this.injectFailureNode(params.originNodeId, params.action, result.message);
-      })
-      .catch((error) => {
-        if (this.destroyed) return;
-        new import_obsidian.Notice(
-          "Launching " + params.planName + " failed unexpectedly: " + ((error && error.message) || error)
-        );
+      )
+      .then(() => {
+        flowLaunchesInFlight.delete(key);
       });
   }
 
@@ -11605,27 +11708,57 @@ var FlowGraphPane = class {
   // document watcher firing on a real render -- which is every bit as final
   // as never having written it (task 1.5).
   injectFailureNode(originNodeId, action, message) {
-    if (this.destroyed || !this.document || !Array.isArray(this.document.nodes)) return;
-    if (!this.byId || !this.byId.has(originNodeId)) return;
-    const id = "launch-failure:" + originNodeId + ":" + Date.now();
-    const failedNode = {
-      "graph.node.id": id,
-      "graph.node.parent_id": originNodeId,
-      "graph.node.name": action === FLOW_ACTION_FORK ? "fork refused" : "launch refused",
-      kind: "launch_failed",
-      outcome: "errored",
-      error: message
-    };
-    this.document.nodes.push(failedNode);
-    this.document.edges = (this.document.edges || []).concat([
-      {
-        source: originNodeId,
-        target: id,
-        relation: action === FLOW_ACTION_FORK ? "forked" : "launched"
-      }
-    ]);
+    if (this.destroyed) return;
+    this.pendingFailures.set(originNodeId, { action, message });
+    if (!this._applyPendingFailures()) return;
     this.renderGraph({ keepSelection: true });
-    this.renderDetail(id);
+    this.renderDetail("launch-failure:" + originNodeId);
+  }
+
+  // Puts every pending failure back on this.document (idempotent). Called
+  // after each document replacement so a watcher reload cannot erase a
+  // failure before the operator has read it. Returns whether anything was added.
+  _applyPendingFailures() {
+    const doc = this.document;
+    if (!this.pendingFailures || !this.pendingFailures.size) return false;
+    if (!doc || !Array.isArray(doc.nodes)) return false;
+    let added = false;
+    for (const [originNodeId, failure] of this.pendingFailures) {
+      const id = "launch-failure:" + originNodeId;
+      if (!doc.nodes.some((n) => n["graph.node.id"] === originNodeId)) continue;
+      if (doc.nodes.some((n) => n["graph.node.id"] === id)) continue;
+      doc.nodes.push({
+        "graph.node.id": id,
+        "graph.node.parent_id": originNodeId,
+        "graph.node.name": failure.action === FLOW_ACTION_FORK ? "fork refused" : "launch refused",
+        kind: "launch_failed",
+        outcome: "errored",
+        error: failure.message
+      });
+      doc.edges = (doc.edges || []).concat([
+        {
+          source: originNodeId,
+          target: id,
+          relation: failure.action === FLOW_ACTION_FORK ? "forked" : "launched"
+        }
+      ]);
+      added = true;
+    }
+    return added;
+  }
+
+  // Removes a shown failure (a new launch from the node, or the operator's
+  // Dismiss). The in-memory node goes with it.
+  dismissFailure(originNodeId) {
+    if (!this.pendingFailures || !this.pendingFailures.delete(originNodeId)) return;
+    const doc = this.document;
+    if (!doc || !Array.isArray(doc.nodes)) return;
+    const id = "launch-failure:" + originNodeId;
+    doc.nodes = doc.nodes.filter((n) => n["graph.node.id"] !== id);
+    doc.edges = (doc.edges || []).filter((e) => e.target !== id);
+    if (this.destroyed) return;
+    this.renderGraph({ keepSelection: false });
+    this.renderDetail(originNodeId);
   }
 
   // The two vault files this document was rendered into, and the one file it was
