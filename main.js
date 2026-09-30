@@ -7569,8 +7569,23 @@ var TerminalView = class extends import_obsidian.ItemView {
     return { entries, refused: listed.refused, error: null };
   }
 
+  // One list spawn at a time per tab. A second click or hotkey press while the
+  // first is still running is dropped, not queued: two lists resolving in turn
+  // would each switch. The view may also be closed while the spawn runs.
+  async loadSessionEntriesOnce() {
+    if (this._sessionListBusy) return null;
+    this._sessionListBusy = true;
+    try {
+      const result = await this.loadSessionEntries();
+      return this._isDisposed ? null : result;
+    } finally {
+      this._sessionListBusy = false;
+    }
+  }
+
   async openSessionMenu() {
-    const result = await this.loadSessionEntries();
+    const result = await this.loadSessionEntriesOnce();
+    if (!result) return;
     if (result.error) {
       new import_obsidian.Notice(result.error);
       return;
@@ -7596,7 +7611,8 @@ var TerminalView = class extends import_obsidian.ItemView {
   }
 
   async cycleSession(step) {
-    const result = await this.loadSessionEntries();
+    const result = await this.loadSessionEntriesOnce();
+    if (!result) return;
     if (result.error) {
       new import_obsidian.Notice(result.error);
       return;
@@ -7609,15 +7625,30 @@ var TerminalView = class extends import_obsidian.ItemView {
     this.switchToSession(target);
   }
 
+  // Set when this tab cannot attach a Claude Code session at all. Checked before
+  // the confirm dialog, so the dialog never promises a switch that is refused.
+  sessionAttachBackendProblem() {
+    return this.getBackendKey() !== "claude"
+      ? "Session cycling attaches Claude Code sessions; this tab runs another provider."
+      : null;
+  }
+
   switchToSession(entry) {
+    if (this._isDisposed) return;
     const plan = flowAttachPlan({ session_id: entry.sessionId, cwd: entry.cwd });
     if (plan.problem) {
       new import_obsidian.Notice(plan.problem);
       return;
     }
     if (entry.sessionId === this.sessionId) return;
+    const backendProblem = this.sessionAttachBackendProblem();
+    if (backendProblem) {
+      new import_obsidian.Notice(backendProblem);
+      return;
+    }
     const attach = () => {
-      this.term?.reset();
+      if (this._isDisposed) return;
+      // The terminal is cleared inside startShell, after its guards pass.
       this.startShell(null, false, false, { sessionId: plan.sessionId, cwd: plan.cwd });
       this.renderSessionHeader();
     };
@@ -8251,13 +8282,16 @@ var TerminalView = class extends import_obsidian.ItemView {
       this.term?.writeln("");
       return;
     }
-    if (attachPlan && this.getBackendKey() !== "claude") {
+    if (attachPlan && this.sessionAttachBackendProblem()) {
       this.term?.writeln("");
-      this.term?.writeln("Session cycling attaches Claude Code sessions; this tab runs another provider.");
+      this.term?.writeln(this.sessionAttachBackendProblem());
       this.term?.writeln("");
       return;
     }
     this.stopShell();
+    // An attach replaces what is on screen. Cleared only here, once the guards
+    // above have passed and the old shell is really gone.
+    if (attachPlan) this.term?.reset();
     const defaultDir = this.plugin.pluginData.defaultWorkingDir;
     const vaultPath = this.plugin.getVaultPath();
     const resolvedDefault = defaultDir ? path.resolve(vaultPath, defaultDir) : vaultPath;
@@ -10776,7 +10810,12 @@ function flowSubagentChildren(document) {
       const id = node["graph.node.id"];
       if (seen.has(id)) continue;
       seen.add(id);
-      if (node.kind !== "dispatch") continue;
+      if (node.kind !== "dispatch") {
+        // Pass through without drawing: flow parents parallel dispatches under
+        // an orchestrator ("fan-out of N"), and the subagents are beneath it.
+        walk(id, depth);
+        continue;
+      }
       out.push({
         id,
         name: node["graph.node.name"] || node.agent_type || "subagent",
@@ -10816,8 +10855,12 @@ function flowSessionEntries(rows, activeId, readGraph) {
 // Keyboard cycle. When the active session is not in the list (a fresh tab, or
 // one older than the window) forward lands on the first entry and backward on
 // the last, rather than doing nothing.
-function flowCycleTarget(entries, activeId, step) {
-  if (!entries || !entries.length) return null;
+// The list arrives newest-touched first and an attach touches the session it
+// lands on, so indexing into it would bounce between two sessions. The cycle
+// runs over a fixed order (by id) instead; only the dropdown shows recency.
+function flowCycleTarget(input, activeId, step) {
+  if (!input || !input.length) return null;
+  const entries = input.slice().sort((a, b) => (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0));
   const at = entries.findIndex((e) => e.sessionId === activeId);
   if (at === -1) return step < 0 ? entries[entries.length - 1] : entries[0];
   return entries[(at + (step < 0 ? -1 : 1) + entries.length) % entries.length];
@@ -10845,15 +10888,22 @@ function flowListSessions(opts, deps) {
   if (!opts || !opts.projCliRepoPath) {
     return Promise.resolve({ rows: [], refused: 0, error: "proj-cli was not found." });
   }
-  return spawn(opts.pythonCmd, flowSessionListArgv(opts.limit), {
+  if (!opts.pythonCmd) {
+    return Promise.resolve({ rows: [], refused: 0, error: "Python was not found, so proj-cli cannot list sessions." });
+  }
+  // A spawner that throws or rejects becomes an error result, never an
+  // unhandled rejection out of a click handler.
+  return Promise.resolve().then(() => spawn(opts.pythonCmd, flowSessionListArgv(opts.limit), {
     cwd: opts.projCliRepoPath,
     timeoutMs: opts.timeoutMs || FLOW_SESSION_LIST_TIMEOUT_MS
-  }).then((result) => {
-    if (result.code !== 0) {
-      return { rows: [], refused: 0, error: "proj-cli list failed: " + flowClip(result.stderr || ("exit " + result.code), 160) };
+  })).then((result) => {
+    if (!result || result.code !== 0) {
+      return { rows: [], refused: 0, error: "proj-cli list failed: " + flowClip((result && result.stderr) || ("exit " + (result && result.code)), 160) };
     }
     return flowParseSessionList(result.stdout);
-  });
+  }, (error) => ({
+    rows: [], refused: 0, error: "proj-cli list failed: " + flowClip(String((error && error.message) || error), 160)
+  }));
 }
 
 // The real spawner flowRunAction uses outside a test. Piped, never shelled --

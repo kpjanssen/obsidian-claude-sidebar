@@ -23,6 +23,12 @@ const whole = fs.readFileSync(path.join(__dirname, "..", "main.js"), "utf8");
 const region = whole.slice(whole.indexOf(BEGIN), whole.indexOf(END));
 const methods = whole.slice(whole.indexOf(CYCLE_BEGIN), whole.indexOf(CYCLE_END, whole.indexOf(CYCLE_BEGIN)));
 if (!region || !methods) throw new Error("markers moved in main.js");
+// startShell up to and including the clear that follows stopShell(): everything
+// that decides whether an attach is refused, without the PTY that follows.
+const SHELL_BEGIN = "  startShell(workingDir = null";
+const shellStart = whole.indexOf(SHELL_BEGIN);
+const shellGuards = whole.slice(shellStart, whole.indexOf("    const defaultDir", shellStart)) + "  }\n";
+if (shellStart === -1 || shellGuards.indexOf("this.stopShell()") === -1) throw new Error("startShell moved in main.js");
 
 globalThis.__notices = [];
 globalThis.__menus = [];
@@ -58,7 +64,8 @@ const F = new Function(
   stub +
     region +
     "\nclass Cycler {\n" + methods + "\n}\n" +
-    "return { Cycler, flowSessionResumeProblem, flowParseSessionList, flowResumeShellCommand, flowAttachPlan," +
+    "\nclass Shell {\n" + methods + shellGuards + "}\n" +
+    "return { Cycler, Shell, flowSessionResumeProblem, flowParseSessionList, flowResumeShellCommand, flowAttachPlan," +
     " flowSubagentChildren, flowSessionEntries, flowCycleTarget, flowSessionLabel, flowListSessions," +
     " flowSessionListArgv, flowResolveProjCliRepoPath, flowProjCliRepoLooksReal, FLOW_PROJ_CLI_REPO_ENV_VAR," +
     " FLOW_SESSION_ID_RE, flowWorkVaultProblem, flowResetPythonCache };"
@@ -179,6 +186,31 @@ function graph(sessionId, dispatches) {
   check(labels[1].endsWith("(active)"), "the active session is marked");
 }
 
+// A parallel dispatch is parented under an orchestrator node ("fan-out of N"),
+// as proj-flow's extract.py writes it. The picker must see through it.
+{
+  const doc = graph(A, [
+    { id: "orch:1", name: "fan-out of 3", kind: "orchestrator", ordinal: 1 },
+    { id: "d:1", name: "one", parent: "orch:1", ordinal: 2 },
+    { id: "d:2", name: "two", parent: "orch:1", ordinal: 3 },
+    { id: "d:3", name: "three", parent: "orch:1", ordinal: 4 },
+    { id: "d:2a", name: "two-child", parent: "d:2", ordinal: 5 },
+    { id: "d:solo", name: "solo", ordinal: 6 }
+  ]);
+  const kids = F.flowSubagentChildren(doc);
+  equal(
+    kids.map((k) => [k.name, k.depth]),
+    [["one", 1], ["two", 1], ["two-child", 2], ["three", 1], ["solo", 1]],
+    "dispatches under a fan-out orchestrator are listed at the session's depth; the orchestrator is not drawn"
+  );
+  const deep = graph(A, [
+    { id: "orch:1", name: "fan-out of 1", kind: "orchestrator", ordinal: 1 },
+    { id: "join:1", name: "j", kind: "join", parent: "orch:1", ordinal: 2 },
+    { id: "d:1", name: "under two pass-throughs", parent: "join:1", ordinal: 3 }
+  ]);
+  equal(F.flowSubagentChildren(deep).map((k) => k.name), ["under two pass-throughs"], "any number of pass-through nodes is walked");
+}
+
 // ---- cycling ---------------------------------------------------------------
 
 {
@@ -190,6 +222,15 @@ function graph(sessionId, dispatches) {
   equal(F.flowCycleTarget(e, "unlisted", 1).sessionId, A, "an unlisted active session goes forward to the first");
   equal(F.flowCycleTarget(e, "unlisted", -1).sessionId, C, "and backward to the last");
   equal(F.flowCycleTarget([], A, 1), null, "nothing to cycle to");
+
+  // The list is ordered by recency and an attach reshuffles it. Cycling must
+  // still walk A -> B -> C, not bounce between A and B.
+  const recency1 = F.flowSessionEntries([row(A), row(B), row(C)], A, null);
+  const first = F.flowCycleTarget(recency1, A, 1).sessionId;
+  const recency2 = F.flowSessionEntries([row(first), row(A), row(C)], first, null);
+  equal([first, F.flowCycleTarget(recency2, first, 1).sessionId], [B, C], "cycling reaches the third session after the list reshuffles");
+  const shuffled = F.flowSessionEntries([row(C), row(A), row(B)], B, null);
+  equal(F.flowCycleTarget(shuffled, B, 1).sessionId, C, "the order does not depend on the order the list arrived in");
 }
 
 // ---- the view, with fakes --------------------------------------------------
@@ -204,6 +245,7 @@ function fakeView(overrides) {
   view.switchButtonEl = null;
   view.starts = [];
   view.startShell = function () { view.starts.push(Array.from(arguments)); };
+  view.getBackendKey = () => overrides.backend || "claude";
   view.renderSessionHeader = function () {};
   view.sessionCyclingAvailable = () => true;
   return view;
@@ -274,7 +316,7 @@ pending.push(
       picker.switchToSession(loaded.entries[0]);
       equal(picker.starts.length, 1, "a pick starts the terminal once");
       equal(picker.starts[0][3], { sessionId: A, cwd: VAULT }, "with the picked id and its directory as the attach");
-      equal(picker.resets, 1, "the terminal is cleared first");
+      check(!picker.resets, "switchToSession does not clear the terminal itself; startShell does, after its guards");
 
       // the active session is a no-op
       const same = fakeView({ base: tmp, sessionId: B });
@@ -309,6 +351,108 @@ pending.push(
       backwards.loadSessionEntries = () => view.loadSessionEntries({ spawn, pythonCmd: "python" });
       await backwards.cycleSession(-1);
       equal(backwards.starts[0][3].sessionId, B, "previous wraps to the last");
+
+      // ---- robustness: list failure modes ----
+      const timedOut = await fakeView({ base: tmp }).loadSessionEntries({
+        spawn: async () => ({ code: null, stdout: "", stderr: "timed out after 15s and was stopped" }),
+        pythonCmd: "python"
+      });
+      check(/proj-cli list failed: timed out/.test(timedOut.error || ""), "a timeout (code null) is reported with its message, not as an empty list");
+      equal(timedOut.entries, [], "and yields no entries");
+      const rejected = await fakeView({ base: tmp }).loadSessionEntries({
+        spawn: () => Promise.reject(new Error("spawn python ENOENT")),
+        pythonCmd: "python"
+      });
+      check(/ENOENT/.test(rejected.error || ""), "a rejecting spawner becomes an error result, not an unhandled rejection");
+      const threw = await fakeView({ base: tmp }).loadSessionEntries({
+        spawn: () => { throw new Error("sync boom"); },
+        pythonCmd: "python"
+      });
+      check(/sync boom/.test(threw.error || ""), "a throwing spawner becomes an error result too");
+      const spawnedNone = fakeSpawn("[]");
+      const noPython = await F.flowListSessions({ projCliRepoPath: repo, pythonCmd: null }, { spawn: spawnedNone });
+      check(/Python was not found/.test(noPython.error || ""), "no python interpreter is a clear error");
+      equal(spawnedNone.calls.length, 0, "and nothing is spawned without one");
+      // the menu surfaces a list error instead of throwing
+      globalThis.__notices.length = 0;
+      globalThis.__menus.length = 0;
+      const erroring = fakeView({ base: tmp });
+      const realLoad = erroring.loadSessionEntries;
+      erroring.loadSessionEntries = () => realLoad.call(erroring, { spawn: () => Promise.reject(new Error("nope")), pythonCmd: "python" });
+      await erroring.openSessionMenu();
+      check(/nope/.test(globalThis.__notices.join("|")) && globalThis.__menus.length === 0, "a rejected list shows a notice and no menu");
+      equal(erroring._sessionListBusy, false, "and the busy flag is released after an error");
+
+      // a checkout path with spaces reaches the spawner as one cwd, never joined into argv
+      const spaced = path.join(tmp, "my repos", "proj cli");
+      fs.mkdirSync(path.join(spaced, "proj_cli"), { recursive: true });
+      fs.writeFileSync(path.join(spaced, "proj_cli", "__main__.py"), "");
+      process.env[F.FLOW_PROJ_CLI_REPO_ENV_VAR] = spaced;
+      const spacedSpawn = fakeSpawn("[]");
+      await fakeView({ base: tmp }).loadSessionEntries({ spawn: spacedSpawn, pythonCmd: "python" });
+      equal(spacedSpawn.calls[0].options.cwd, spaced, "a repo path with spaces is passed whole as cwd");
+      check(spacedSpawn.calls[0].argv.every((a) => a.indexOf(spaced) === -1 && a.indexOf(" ") === -1), "and appears in no argv element");
+      process.env[F.FLOW_PROJ_CLI_REPO_ENV_VAR] = repo;
+
+      // ---- a non-claude tab is refused before the dialog, and nothing is cleared ----
+      globalThis.__modals.length = 0;
+      globalThis.__notices.length = 0;
+      const other = fakeView({ base: tmp, sessionId: B, proc: { killed: false }, backend: "codex" });
+      other.switchToSession(loaded.entries[0]);
+      equal(globalThis.__modals.length, 0, "no confirm dialog is offered for an attach that would be refused");
+      check(/another provider/.test(globalThis.__notices.join("|")), "the operator is told why");
+      equal([other.starts.length, other.resets || 0], [0, 0], "nothing started and nothing cleared");
+
+      // ---- a view closed during the list spawn does nothing afterwards ----
+      const deferred = () => {
+        let release;
+        const gate = new Promise((r) => { release = r; });
+        const spawn = (cmd, argv, options) => { spawn.calls.push({ cmd, argv, options }); return gate; };
+        spawn.calls = [];
+        spawn.release = (stdout) => release({ code: 0, stdout, stderr: "" });
+        return spawn;
+      };
+      const listJson = JSON.stringify([row(A), row(B), row(C)]);
+      {
+        const slow = deferred();
+        const closing = fakeView({ base: tmp, sessionId: A });
+        closing.loadSessionEntries = () => view.loadSessionEntries({ spawn: slow, pythonCmd: "python" });
+        globalThis.__menus.length = 0;
+        const pendingCycle = closing.cycleSession(1);
+        const pendingMenu = closing.openSessionMenu();
+        closing._isDisposed = true;
+        slow.release(listJson);
+        await Promise.all([pendingCycle, pendingMenu]);
+        equal(closing.starts.length, 0, "a cycle resolving after the view closed starts no terminal");
+        equal(globalThis.__menus.length, 0, "and a menu resolving after close is not opened");
+        equal(closing._sessionListBusy, false, "the busy flag is released once the spawn settles");
+
+        // a confirm answered after close does not attach either
+        globalThis.__modals.length = 0;
+        const late = fakeView({ base: tmp, sessionId: B, proc: { killed: false } });
+        late.switchToSession(loaded.entries[0]);
+        late._isDisposed = true;
+        globalThis.__modals[0].contentEl.children.filter((c) => c.children.length).pop().children.find((b) => b.text === "Switch").handlers.click();
+        equal(late.starts.length, 0, "a Switch confirmed after close attaches nothing");
+      }
+
+      // ---- overlapping presses: one list spawn, one switch ----
+      {
+        const slow = deferred();
+        const twice = fakeView({ base: tmp, sessionId: A });
+        twice.loadSessionEntries = () => view.loadSessionEntries({ spawn: slow, pythonCmd: "python" });
+        globalThis.__menus.length = 0;
+        const one = twice.cycleSession(1);
+        const two = twice.cycleSession(1);
+        const three = twice.openSessionMenu();
+        slow.release(listJson);
+        await Promise.all([one, two, three]);
+        equal(slow.calls.length, 1, "three overlapping requests spawn proj-cli once");
+        equal(twice.starts.length, 1, "and switch once");
+        equal(globalThis.__menus.length, 0, "the overlapping menu request is dropped, not stacked");
+        await twice.cycleSession(1);
+        equal(slow.calls.length, 2, "a later request, after the first settled, runs normally");
+      }
     } finally {
       if (prev === undefined) delete process.env[F.FLOW_PROJ_CLI_REPO_ENV_VAR];
       else process.env[F.FLOW_PROJ_CLI_REPO_ENV_VAR] = prev;
@@ -333,6 +477,37 @@ pending.push(
     "no line of the attach path builds claude flags"
   );
   check(body.indexOf("if (!attachPlan) {") !== -1, "an attach does not overwrite lastCwd");
+}
+
+// ---- startShell's refusal branches, behaviour ---------------------------------
+{
+  const shell = (overrides) => {
+    const s = new F.Shell();
+    const said = [];
+    s.calls = [];
+    s.term = { reset() { s.calls.push("reset"); }, writeln(t) { said.push(t); } };
+    s.stopShell = () => s.calls.push("stop");
+    s.getBackendKey = () => overrides.backend || "claude";
+    s.said = said;
+    return s;
+  };
+  const other = shell({ backend: "codex" });
+  other.startShell(null, false, false, { sessionId: A, cwd: VAULT });
+  equal(other.calls, [], "a non-claude tab: the old shell is not stopped and the screen is not cleared");
+  check(other.said.some((l) => /another provider/.test(l)), "and the refusal is written");
+  const bad = shell({});
+  bad.startShell(null, false, false, { sessionId: A, cwd: WORK });
+  equal(bad.calls, [], "an attach plan with a problem: nothing stopped, nothing cleared");
+  check(bad.said.some((l) => /professional vault/.test(l)), "and the reason is written");
+  const notUuid = shell({});
+  notUuid.startShell(null, false, false, { sessionId: "not-a-uuid", cwd: VAULT });
+  equal(notUuid.calls, [], "a bad session id: nothing stopped, nothing cleared");
+  const ok = shell({});
+  ok.startShell(null, false, false, { sessionId: A, cwd: VAULT });
+  equal(ok.calls, ["stop", "reset"], "a passing attach stops the old shell, then clears the screen");
+  const plain = shell({});
+  plain.startShell();
+  equal(plain.calls, ["stop"], "an ordinary start does not clear the screen");
 }
 
 Promise.all(pending)
