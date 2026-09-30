@@ -8661,7 +8661,23 @@ var ClaudeSidebarSettingsTab = class extends import_obsidian.PluginSettingTab {
         "There is no path setting and no profile selector: a stored absolute path " +
         "would be wrong on the other machine this vault syncs to, and widening the " +
         "view to another profile is not something a setting is allowed to do. " +
-        "The view is read-only and writes no file into the vault."
+        "The pane itself writes no file into the vault; a plan's Launch button and a " +
+        "run's Fork button spawn flow compile and flow launch as separate processes " +
+        "instead (launch-runs-from-graph)."
+      );
+    // Deliberately settings-free for the same reason the field above is: a
+    // stored absolute path is wrong on whichever machine did not write it.
+    // FLOW_REPO_PATH is an environment variable rather than a field here, on
+    // the same terms proj-cli's own README documents PROJ_CLI_VAULT.
+    new import_obsidian.Setting(containerEl)
+      .setName("Launching a run from the graph")
+      .setDesc(
+        "A plan's root node offers Launch and a run's session node offers Fork once " +
+        "the proj-flow repository is found -- absent otherwise, never a disabled " +
+        "button. Resolved fresh from the environment on every click, never stored " +
+        "here: " + FLOW_REPO_ENV_VAR + " overrides, and without it " +
+        (flowDefaultRepoPath() || "no default exists on this platform") +
+        " is tried and verified before either button is drawn."
       );
   }
 };
@@ -10188,6 +10204,369 @@ function flowElapsed(node) {
 }
 
 // ---------------------------------------------------------------------------
+// Node actions -- the plugin half of launch-runs-from-graph
+// (proj-flow/openspec/changes/launch-runs-from-graph/tasks.md, group 1 and
+// tasks 2.1/2.3/2.4; task 2.2 -- the fork's own shape at the compile layer --
+// was built and tested in proj-flow itself, not here).
+//
+// The rule this whole section exists to keep: this pane decides *whether* a
+// node offers an action and *what it states before asking*, and nothing past
+// that. Every refusal -- a bypass flag, an unnamed model, a vanished fork
+// target, the cross-vault boundary -- is asserted in flow/compile.py and
+// flow/launch.py, and is re-asserted there even where this file could have
+// caught it first: a second copy of a refusal, in a second language, is
+// exactly the drift launch-runs-from-graph's own design document was split
+// to prevent. What follows builds the argv `flow` itself is spawned with --
+// a mode, --plan, --vault, and for a fork --resume/--origin-node -- never
+// the argv the spawned Claude session runs with, and this pane never spawns
+// `claude` by name; every child process it starts is `python -m flow`.
+// ---------------------------------------------------------------------------
+
+var FLOW_ACTION_LAUNCH = "launch";
+var FLOW_ACTION_FORK = "fork";
+
+// Task 1.1: the action a node offers comes from its kind and the document it
+// sits in, not from a separate list this file would have to keep in step
+// with the contract. A plan's root is work that has not run yet, so it
+// offers Launch. A run's session node already has a transcript, so it
+// offers Fork, and nothing else does -- a dispatch inside either document is
+// not something a person launches or forks on its own.
+function flowActionForNode(doc, node) {
+  if (!doc || !node) return null;
+  if (flowDocumentKind(doc) === "plan" && node === flowRootNode(doc)) {
+    return FLOW_ACTION_LAUNCH;
+  }
+  if (flowDocumentKind(doc) === "run" && node.kind === "session") {
+    return FLOW_ACTION_FORK;
+  }
+  return null;
+}
+
+// What the confirmation dialog states about a plan before anything runs: the
+// model its root node names, read the same way flow/compile.py reads it --
+// root.get("model") -- so the preview can never promise something
+// compilation would then refuse to honour. Absent stays absent: a plan whose
+// root names no model shows that fact rather than a guessed default, because
+// compiling it will refuse for exactly that reason.
+function flowPlanPreview(planDoc) {
+  const root = flowRootNode(planDoc);
+  return { model: (root && root.model) || null };
+}
+
+// flow/modes/launch.py: the confirmation phrase is `"launch %s" % name`,
+// exactly, and a launch with no --confirm (or the wrong one) is a dry run
+// that starts nothing. Built here, once, so this pane and the spawned
+// process can never quietly disagree about the phrase's shape.
+function flowConfirmPhrase(planName) {
+  return "launch " + planName;
+}
+
+// The exact argv `flow` is spawned with. `opts` carries only ids and names a
+// person did not type freehand: `planName` and `resumeSessionId` are read
+// off a document this pane already loaded, `originNodeId` is the id of the
+// node the action was taken from, and `vaultPath` is the path Obsidian
+// already has open. Nothing here is a refusal or a model default -- see the
+// section banner above.
+function flowChildArgv(mode, opts) {
+  const argv = ["-m", "flow", mode, "--plan", opts.planName, "--vault", opts.vaultPath, "--json"];
+  if (mode === "compile") {
+    if (opts.originNodeId) argv.push("--origin-node", opts.originNodeId);
+    if (opts.resumeSessionId) argv.push("--resume", opts.resumeSessionId);
+  } else if (mode === "launch" && opts.confirmPhrase) {
+    argv.push("--confirm", opts.confirmPhrase);
+  }
+  return argv;
+}
+
+// `flow launch --json` exits 0 whether the run it started completed,
+// authentication-failed, or never started at all -- flow/modes/launch.py
+// only returns non-zero for a refusal raised *before* anything was spawned.
+// So a clean exit is not a successful run; the printed JSON (one result per
+// plan root, almost always one) is the fact that actually says so, and the
+// two must be read together for task 2.4's "never as a silent absence" to
+// hold.
+function flowLaunchSucceeded(parsedResults) {
+  return (
+    Array.isArray(parsedResults) &&
+    parsedResults.length > 0 &&
+    parsedResults.every((r) => r && r.outcome === "completed")
+  );
+}
+
+// The message task 2.4 asks a failed launch to carry, built from whichever
+// result was not `completed` -- the first offender when several roots were
+// compiled, which is the common case of exactly one. Every part named here
+// is a field flow/launch.py already returns; nothing is inferred.
+function flowLaunchFailureMessage(parsedResults) {
+  if (!Array.isArray(parsedResults) || !parsedResults.length) {
+    return "flow launch printed no result.";
+  }
+  const bad = parsedResults.find((r) => r && r.outcome !== "completed") || parsedResults[0];
+  const parts = [bad.outcome || "unknown outcome"];
+  if (bad.error) parts.push(bad.error);
+  if (bad.returncode !== undefined && bad.returncode !== null) parts.push("exit " + bad.returncode);
+  if (bad.log) parts.push("log: " + bad.log);
+  return parts.join(" \u2014 ");
+}
+
+// Task 1.4: re-checked at confirmation time, not only when the dialog
+// opened. Between the two, the document watcher may have re-rendered, so the
+// plan this dialog is about to compile must still be the plan it showed.
+// `snapshot` is taken when the dialog opens and `current` is taken again the
+// instant Confirm is pressed; any drift -- a different file, a different
+// modified time, or the origin node no longer present in the loaded document
+// -- refuses rather than compiling against a picture that is no longer true.
+// `flow compile` itself reads the plan fresh every time it runs, so this is
+// not a race the server could lose; it is the dialog keeping the promise it
+// already made on screen.
+function flowTargetStillValid(snapshot, current) {
+  if (!snapshot || !current) return false;
+  if (!current.nodePresent) return false;
+  if (snapshot.planFile !== current.planFile) return false;
+  if (snapshot.planMtimeMs !== current.planMtimeMs) return false;
+  return true;
+}
+
+// Where `flow` lives, resolved the same way proj-cli's own README documents
+// PROJ_CLI_VAULT: an environment variable overrides, and without one a
+// conventional path is tried; a missing repository is reported as absent
+// rather than guessed at further. Never stored in this plugin's settings
+// file, for the reason the "Run graph" section of the settings tab already
+// gives for the vault path itself -- a settings file syncs between two
+// machines over OneDrive, and an absolute path written on one is wrong on
+// the other. This is resolved fresh from the process environment on every
+// action, never persisted.
+var FLOW_REPO_ENV_VAR = "FLOW_REPO_PATH";
+
+function flowDefaultRepoPath() {
+  return process.platform === "win32" ? "C:\\Repos\\proj-flow" : null;
+}
+
+// A directory existing is not enough -- a stale or half-removed checkout
+// would still pass a bare existence check on itself. flow/__main__.py is the
+// one file every mode ultimately runs through, so its presence is the
+// cheapest real signal that `python -m flow` will find something to run.
+// `existsFn` is injected so a test can assert both branches with no real
+// filesystem.
+function flowRepoLooksReal(repoPath, existsFn) {
+  if (!repoPath) return false;
+  const sep = repoPath.indexOf("\\") !== -1 && repoPath.indexOf("/") === -1 ? "\\" : "/";
+  const marker = repoPath.replace(/[\\/]+$/, "") + sep + "flow" + sep + "__main__.py";
+  return !!existsFn(marker);
+}
+
+function flowResolveRepoPath(env, existsFn) {
+  const fromEnv = ((env && env[FLOW_REPO_ENV_VAR]) || "").trim();
+  const candidate = fromEnv || flowDefaultRepoPath();
+  if (!candidate) return null;
+  return flowRepoLooksReal(candidate, existsFn) ? candidate : null;
+}
+
+// The same three-step probe startShell already runs to find Python on
+// Windows, read out here as a pure decision so it can be tested without
+// spawning anything. Duplicated rather than shared with startShell: that
+// path is named "tread carefully" in AGENTS.md (Windows PTY lifecycle),
+// spawns a PTY and a shell this feature does not need, and a change made for
+// one purpose should not risk the other.
+function flowResolvePythonCmd(platform, hasPyLauncher, wherePythonPaths) {
+  if (platform !== "win32") return "python3";
+  if (hasPyLauncher) return "py";
+  const candidates = (wherePythonPaths || []).filter(Boolean);
+  const batShim = candidates.find((p) => p.toLowerCase().endsWith(".bat"));
+  if (batShim) return batShim;
+  if (candidates.length) return candidates[0];
+  return "python";
+}
+
+// The two-step spawn itself: compile, then launch, in that order, each
+// waited on before the next starts -- launch is never attempted after a
+// compile refusal. `deps.spawn` is injected exactly the way
+// flow/launch.py's own `launch()` injects its spawner, so task 2.1's "tests
+// use a fake spawner and assert the exact child-process calls" reads on this
+// function with no Python interpreter and no Claude session involved.
+// Compile's own exit code is the whole truth about whether it refused
+// (flow/modes/compile.py returns 1 on CompileRefused); launch's is not (see
+// flowLaunchSucceeded above), so only launch also parses its --json output.
+// Nothing here writes a file, edits a transcript, or deletes anything (task
+// 1.5) -- the two spawns are the only effect.
+function flowRunAction(opts, deps) {
+  const spawn = (deps && deps.spawn) || flowSpawnChild;
+  const cwd = opts.flowRepoPath;
+  const compileArgv = flowChildArgv("compile", opts);
+  return spawn(opts.pythonCmd, compileArgv, { cwd }).then((compiled) => {
+    if (compiled.code !== 0) {
+      return {
+        ok: false,
+        stage: "compile",
+        argv: compileArgv,
+        cwd,
+        message: (compiled.stderr || compiled.stdout || "flow compile exited " + compiled.code).trim()
+      };
+    }
+    const launchArgv = flowChildArgv(
+      "launch",
+      Object.assign({}, opts, { confirmPhrase: flowConfirmPhrase(opts.planName) })
+    );
+    // Detached, and only this call: what it spawns is the point of
+    // launch-runs-headless in the first place -- a run that outlives the
+    // editor that started it -- and killing it when this pane closes would
+    // undo exactly the decoupling that split was for.
+    return spawn(opts.pythonCmd, launchArgv, { cwd, detached: true }).then((launched) => {
+      if (launched.code !== 0) {
+        return {
+          ok: false,
+          stage: "launch",
+          argv: launchArgv,
+          cwd,
+          message: (launched.stderr || launched.stdout || "flow launch exited " + launched.code).trim()
+        };
+      }
+      let parsed = null;
+      try {
+        parsed = JSON.parse(launched.stdout);
+      } catch (_err) {
+        parsed = null;
+      }
+      if (!flowLaunchSucceeded(parsed)) {
+        return {
+          ok: false,
+          stage: "launch",
+          argv: launchArgv,
+          cwd,
+          message: parsed
+            ? flowLaunchFailureMessage(parsed)
+            : "flow launch printed output this pane could not parse as JSON."
+        };
+      }
+      return { ok: true, stage: "launch", argv: launchArgv, cwd, results: parsed };
+    });
+  });
+}
+
+// The real spawner flowRunAction uses outside a test. Piped, never shelled --
+// argv reaches the child as an array, so nothing in a plan name or a session
+// id is ever re-interpreted by a shell.
+function flowSpawnChild(cmd, argv, options) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = import_child_process.spawn(cmd, argv, {
+        cwd: options.cwd,
+        env: process.env,
+        windowsHide: true,
+        detached: !!options.detached
+      });
+    } catch (error) {
+      resolve({ code: null, stdout: "", stderr: String((error && error.message) || error) });
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    if (child.stdout) child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
+    if (child.stderr) child.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
+    child.on("error", (error) => {
+      resolve({ code: null, stdout, stderr: stderr || String((error && error.message) || error) });
+    });
+    child.on("close", (code) => {
+      resolve({ code, stdout, stderr });
+    });
+    if (options.detached) child.unref();
+  });
+}
+
+// The one dialog this capability ever shows, and the only thing in this pane
+// that requires an answer before something runs (task 1.3: reading actions
+// never confirm, so a prompt from this pane always means a process is about
+// to start). It states exactly what openLaunchDialog computed -- plan,
+// model, working directory, and for a fork, which authored plan to run
+// against the resumed session -- and asks for nothing else. There is no
+// "don't ask again": design.md is explicit that a trusted mode is the thing
+// that turns a confirmation into a formality.
+//
+// Built by a factory rather than declared directly: `class X extends
+// import_obsidian.Modal` resolves that `extends` clause the moment the
+// declaration itself runs, not when a dialog opens, which would put a real
+// obsidian import on the critical path of loading this whole region -- and
+// every test in test/ loads this region as plain text to reach the pure
+// functions above it (see e.g. flow-layout.test.js's own comment on the
+// point: "nothing in the region touches document, fs, path or window until a
+// function is called"). Deferred to first use, this class is no exception.
+var FlowLaunchConfirmModal = null;
+function flowLaunchConfirmModalClass() {
+  if (!FlowLaunchConfirmModal) {
+    FlowLaunchConfirmModal = class extends import_obsidian.Modal {
+      constructor(app, opts) {
+    super(app);
+    this.opts = opts;
+  }
+
+  onOpen() {
+    const el = this.contentEl;
+    el.empty();
+    el.addClass("flow-launch-confirm");
+    const isFork = this.opts.action === FLOW_ACTION_FORK;
+    el.createEl("h2", { text: isFork ? "Fork this run" : "Launch this plan" });
+
+    if (isFork && !this.opts.plans.length) {
+      el.createDiv({
+        cls: "flow-launch-confirm-note",
+        text:
+          "No authored plan exists yet to run against the resumed session. " +
+          "Author one first (\u201cNew workflow\u201d above), then try again."
+      });
+      const closeFooter = el.createDiv({ cls: "flow-launch-confirm-footer" });
+      closeFooter.createEl("button", { text: "Close" }).addEventListener("click", () => this.close());
+      return;
+    }
+
+    const rows = el.createDiv({ cls: "flow-launch-confirm-rows" });
+    const row = (label, value) => {
+      const line = rows.createDiv({ cls: "flow-launch-confirm-row" });
+      line.createSpan({ cls: "flow-launch-confirm-label", text: label });
+      return line.createSpan({ cls: "flow-launch-confirm-value", text: value });
+    };
+
+    let planSelect = null;
+    if (isFork) {
+      row("forking", this.opts.forkTitle || String(this.opts.resumeSessionId || "").slice(0, 8));
+      const pickRow = rows.createDiv({ cls: "flow-launch-confirm-row" });
+      pickRow.createSpan({ cls: "flow-launch-confirm-label", text: "under plan" });
+      planSelect = pickRow.createEl("select", { cls: "dropdown" });
+      for (const p of this.opts.plans) {
+        planSelect.createEl("option", { text: p.name, value: p.name });
+      }
+      const modelValueEl = row("model", "\u2014");
+      const updateModel = () => {
+        const preview = this.opts.describePlan(planSelect.value) || { model: null };
+        modelValueEl.textContent = preview.model || "not named on this plan \u2014 compiling will refuse";
+      };
+      planSelect.addEventListener("change", updateModel);
+      updateModel();
+    } else {
+      row("plan", this.opts.planName);
+      row("model", this.opts.model || "not named on the plan \u2014 compiling will refuse");
+    }
+    row("working directory", this.opts.vaultPath);
+
+    const footer = el.createDiv({ cls: "flow-launch-confirm-footer" });
+    footer.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
+    const confirmBtn = footer.createEl("button", { cls: "mod-cta", text: isFork ? "Fork" : "Launch" });
+    confirmBtn.addEventListener("click", () => {
+      const chosenPlan = isFork ? planSelect.value : this.opts.planName;
+      this.close();
+      this.opts.onConfirm(chosenPlan);
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+    };
+  }
+  return FlowLaunchConfirmModal;
+}
+
+// ---------------------------------------------------------------------------
 // The pane
 // ---------------------------------------------------------------------------
 
@@ -10988,6 +11367,13 @@ var FlowGraphPane = class {
       row("tools", counts.map((c) => c[0] + "×" + c[1]).join(", "));
     }
 
+    // The one mutating thing this pane can do, drawn before the reading
+    // actions below so a person sees it without scrolling past everything
+    // else first. Absent, not disabled, when the launching capability itself
+    // is not available (task 1.6) -- renderLaunchActions never creates a
+    // button it would then have to grey out.
+    this.renderLaunchActions(pane, node);
+
     // Where this node can be read in full. The payload note and the canvas are
     // in the vault and open; the transcript is not, so its path is stated
     // rather than offered as a button -- a control that cannot work is worse
@@ -11019,6 +11405,227 @@ var FlowGraphPane = class {
         text: "payload read from " + (payload.source.file || "an unrecorded file")
       });
     }
+  }
+
+  // -- launching (launch-runs-from-graph) ----------------------------------
+
+  // Task 1.1/1.6. Nothing is drawn -- not even a disabled button -- unless
+  // every one of three things is true: the node offers an action at all, this
+  // vault is not itself a professional one (the same flowWorkVaultProblem
+  // check startShell runs before every terminal start), and `flow` can
+  // actually be found. Any one of those failing is silent by design: a
+  // reading pane with no launching capability is simply a reading pane.
+  renderLaunchActions(pane, node) {
+    const doc = this.document || {};
+    const action = flowActionForNode(doc, node);
+    if (!action) return;
+    const vaultPath = this.app.vault.adapter.basePath || "";
+    if (flowWorkVaultProblem(vaultPath)) return;
+    const repoPath = flowResolveRepoPath(process.env, (p) => {
+      try {
+        return fs.existsSync(p);
+      } catch (_err) {
+        return false;
+      }
+    });
+    if (!repoPath) return;
+
+    const section = pane.createDiv({ cls: "flow-detail-section" });
+    const actions = section.createDiv({ cls: "flow-detail-actions" });
+    const button = actions.createEl("button", {
+      cls: "flow-launch-button",
+      text: action === FLOW_ACTION_FORK ? "Fork this run…" : "Launch this plan…"
+    });
+    button.addEventListener("click", () => this.openLaunchDialog(action, node, repoPath, vaultPath));
+  }
+
+  // The file a plan or a run's session document was loaded from, and its
+  // modified time at the moment the dialog opened -- what flowTargetStillValid
+  // compares against a fresh read at confirm time (task 1.4).
+  _launchSnapshot(file) {
+    if (!file) return { planFile: null, planMtimeMs: null };
+    try {
+      const stat = fs.statSync(file);
+      return { planFile: file, planMtimeMs: stat.mtimeMs };
+    } catch (_err) {
+      return { planFile: file, planMtimeMs: null };
+    }
+  }
+
+  openLaunchDialog(action, node, repoPath, vaultPath) {
+    const doc = this.document;
+    if (action === FLOW_ACTION_LAUNCH) {
+      const current = this.summaries.find((s) => s.file === this.selectedFile);
+      const planName = current ? current.sessionId : null;
+      if (!planName) return; // Not actually a plan document; nothing to launch.
+      const preview = flowPlanPreview(doc);
+      const snapshot = this._launchSnapshot(this.selectedFile);
+      const modal = new (flowLaunchConfirmModalClass())(this.app, {
+        action,
+        planName,
+        model: preview.model,
+        vaultPath,
+        onConfirm: () =>
+          this.confirmLaunch({
+            action,
+            repoPath,
+            vaultPath,
+            planName,
+            originNodeId: node["graph.node.id"],
+            resumeSessionId: null,
+            snapshot
+          })
+      });
+      modal.open();
+      return;
+    }
+
+    // Fork. The run being forked names no plan of its own -- flow/compile.py
+    // requires one for every launch, fresh or forked alike -- so the operator
+    // picks from what is already authored (task 1.1's "state" half: no plans
+    // means no Fork button that does anything, stated in the dialog itself
+    // rather than as a disabled control on the node).
+    const plans = this.summaries.filter(
+      (s) => (s.documentClass || "run") === "plan" && !s.unreadable && !s.refused
+    );
+    const modal = new (flowLaunchConfirmModalClass())(this.app, {
+      action,
+      resumeSessionId: doc.session_id,
+      forkTitle: flowFace(node),
+      plans: plans.map((s) => ({ name: s.sessionId, file: s.file })),
+      vaultPath,
+      describePlan: (file) => {
+        const read = flowReadDocument(file);
+        return read.document ? flowPlanPreview(read.document) : { model: null };
+      },
+      onConfirm: (chosenPlanName) => {
+        const chosen = plans.find((s) => s.sessionId === chosenPlanName);
+        this.confirmLaunch({
+          action,
+          repoPath,
+          vaultPath,
+          planName: chosenPlanName,
+          originNodeId: node["graph.node.id"],
+          resumeSessionId: doc.session_id,
+          snapshot: this._launchSnapshot(chosen ? chosen.file : null)
+        });
+      }
+    });
+    modal.open();
+  }
+
+  // Everything between "Confirm was clicked" and the two child processes
+  // being spawned: the re-check task 1.4 asks for, the boundary re-check the
+  // harness this feature shipped under asks for a second time, Python
+  // resolution, and handing off to flowRunAction. Never awaited by the
+  // caller -- flow launch blocks on the whole spawned Claude session, which
+  // can run for as long as that session does, so this pane reports progress
+  // through Notices and the document watcher rather than holding a dialog
+  // open for it.
+  confirmLaunch(params) {
+    const planSummary = this.summaries.find(
+      (s) => (s.documentClass || "run") === "plan" && s.sessionId === params.planName
+    );
+    const current = {
+      nodePresent: !!(this.byId && this.byId.has(params.originNodeId)),
+      planFile: planSummary ? planSummary.file : null,
+      planMtimeMs: planSummary ? this._launchSnapshot(planSummary.file).planMtimeMs : null
+    };
+    if (!flowTargetStillValid(params.snapshot, current)) {
+      new import_obsidian.Notice(
+        "This plan changed or is no longer available since the dialog opened. Nothing was compiled or launched."
+      );
+      return;
+    }
+    // Re-checked immediately before spawning, on the same terms startShell
+    // re-checks it before every terminal start -- belt and suspenders around
+    // the one refusal that must never be skippable.
+    if (flowWorkVaultProblem(params.vaultPath)) {
+      new import_obsidian.Notice("Refusing: this vault is a professional vault. Nothing was started.");
+      return;
+    }
+
+    let hasPy = false;
+    try {
+      import_child_process.execSync("py --version", { stdio: "ignore", timeout: 2000 });
+      hasPy = true;
+    } catch (_err) {}
+    let wherePaths = [];
+    if (!hasPy && process.platform === "win32") {
+      try {
+        const out = import_child_process.execSync("where.exe python", { encoding: "utf8", timeout: 2000 });
+        wherePaths = out
+          .split(/\r?\n/)
+          .map((p) => p.trim())
+          .filter((p) => p && p.indexOf("WindowsApps") === -1);
+      } catch (_err) {}
+    }
+    const pythonCmd = flowResolvePythonCmd(process.platform, hasPy, wherePaths);
+
+    const opts = {
+      planName: params.planName,
+      vaultPath: params.vaultPath,
+      flowRepoPath: params.repoPath,
+      pythonCmd,
+      originNodeId: params.originNodeId,
+      resumeSessionId: params.resumeSessionId || null
+    };
+    new import_obsidian.Notice(
+      (params.action === FLOW_ACTION_FORK ? "Forking " : "Launching ") + params.planName + "…"
+    );
+    flowRunAction(opts, {})
+      .then((result) => {
+        if (this.destroyed) return;
+        if (result.ok) {
+          new import_obsidian.Notice(
+            "flow launch finished for " + params.planName + ". The graph updates once it renders."
+          );
+          return;
+        }
+        new import_obsidian.Notice(
+          "flow " + result.stage + " refused " + params.planName + ": " + flowClip(result.message, 180)
+        );
+        this.injectFailureNode(params.originNodeId, params.action, result.message);
+      })
+      .catch((error) => {
+        if (this.destroyed) return;
+        new import_obsidian.Notice(
+          "Launching " + params.planName + " failed unexpectedly: " + ((error && error.message) || error)
+        );
+      });
+  }
+
+  // Task 2.4: a refusal or a failure is drawn on the node it was issued from,
+  // never swallowed -- and task 2.3 in the same breath: this pane creates no
+  // *real* node at spawn time. The two are reconciled by never writing this
+  // anywhere. It exists only in this.document's in-memory arrays, positioned
+  // by flowLayout exactly like any other child of the origin node and styled
+  // by the errored-outcome rule flowNodeClass already has, and it is gone the
+  // next time this.document is replaced wholesale -- a Refresh, or the
+  // document watcher firing on a real render -- which is every bit as final
+  // as never having written it (task 1.5).
+  injectFailureNode(originNodeId, action, message) {
+    if (this.destroyed || !this.document || !Array.isArray(this.document.nodes)) return;
+    if (!this.byId || !this.byId.has(originNodeId)) return;
+    const id = "launch-failure:" + originNodeId + ":" + Date.now();
+    const failedNode = {
+      "graph.node.id": id,
+      "graph.node.parent_id": originNodeId,
+      "graph.node.name": action === FLOW_ACTION_FORK ? "fork refused" : "launch refused",
+      kind: "launch_failed",
+      outcome: "errored",
+      error: message
+    };
+    this.document.nodes.push(failedNode);
+    this.document.edges = (this.document.edges || []).concat([
+      {
+        source: originNodeId,
+        target: id,
+        relation: action === FLOW_ACTION_FORK ? "forked" : "launched"
+      }
+    ]);
+    this.renderGraph({ keepSelection: true });
+    this.renderDetail(id);
   }
 
   // The two vault files this document was rendered into, and the one file it was

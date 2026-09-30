@@ -629,3 +629,46 @@
 .flow-node-trigger.is-out-of-scope .flow-node-box { fill: none; stroke: var(--text-faint); }
 .flow-node-trigger.is-never-observed .flow-node-box { stroke-dasharray: 4 3; }
 .flow-node-trigger.is-liveness-unavailable .flow-node-box { stroke-dasharray: 1 3; }
+
+/* --- launching a run from the graph (launch-runs-from-graph) ----------- */
+
+.flow-launch-button {
+	font-size: var(--font-ui-smaller);
+	padding: 2px 8px;
+	border-color: var(--color-green, var(--interactive-accent));
+	color: var(--color-green, var(--interactive-accent));
+}
+
+.flow-launch-confirm-rows {
+	display: grid;
+	grid-template-columns: minmax(7em, max-content) 1fr;
+	gap: 4px 10px;
+	align-items: baseline;
+	margin: 10px 0;
+}
+
+.flow-launch-confirm-row {
+	display: contents;
+}
+
+.flow-launch-confirm-label {
+	color: var(--text-muted);
+	white-space: nowrap;
+}
+
+.flow-launch-confirm-value {
+	color: var(--text-normal);
+	word-break: break-word;
+}
+
+.flow-launch-confirm-note {
+	color: var(--text-muted);
+	margin: 8px 0;
+}
+
+.flow-launch-confirm-footer {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-top: 14px;
+}
