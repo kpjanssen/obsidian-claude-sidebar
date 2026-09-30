@@ -7347,6 +7347,17 @@ var TerminalView = class extends import_obsidian.ItemView {
     this.headerEl = container.createDiv({ cls: "flow-session-header" });
     this.headerTitleEl = this.headerEl.createDiv({ cls: "flow-session-title" });
     this.headerMetaEl = this.headerEl.createDiv({ cls: "flow-session-meta" });
+    // Absent, not disabled, when proj-cli cannot be found: the picker is
+    // additive to the terminal and the terminal never depends on it.
+    this.switchButtonEl = null;
+    if (this.sessionCyclingAvailable()) {
+      this.switchButtonEl = this.headerEl.createEl("button", {
+        cls: "flow-session-switch",
+        text: "Sessions ▾"
+      });
+      this.switchButtonEl.setAttr("title", "Switch this tab to another Claude Code session");
+      this.switchButtonEl.addEventListener("click", () => this.openSessionMenu());
+    }
     this.renderSessionHeader();
     // One view, two surfaces (task 8.5). The terminal is the default and is
     // fully usable with no run-graph document present: the graph is additive
@@ -7524,6 +7535,111 @@ var TerminalView = class extends import_obsidian.ItemView {
         window.setTimeout(() => el.setText(part.text), 1200);
       });
     });
+  }
+
+
+  // --- session cycling ------------------------------------------------------
+  // Decisions live in the flow* pure functions; these methods only gather
+  // inputs, draw and hand a pick to startShell.
+  sessionCyclingAvailable() {
+    return !!flowResolveProjCliRepoPath(process.env, (p) => {
+      try { return fs.existsSync(p); } catch (_err) { return false; }
+    });
+  }
+
+  async loadSessionEntries(deps) {
+    const projCliRepoPath = flowResolveProjCliRepoPath(process.env, (p) => {
+      try { return fs.existsSync(p); } catch (_err) { return false; }
+    });
+    const pythonCmd = deps && deps.pythonCmd ? deps.pythonCmd : await flowDetectPythonCmd();
+    const listed = await flowListSessions({ projCliRepoPath, pythonCmd }, deps && deps.spawn ? { spawn: deps.spawn } : {});
+    if (listed.error) return { entries: [], refused: 0, error: listed.error };
+    // The run graphs flow already wrote, keyed by session, for the subagents.
+    const files = new Map();
+    const root = flowGraphRoot(this.app);
+    if (root) {
+      for (const f of flowListDocumentFiles(root).found) {
+        if (f.documentClass === "run") files.set(f.sessionId, f.file);
+      }
+    }
+    const entries = flowSessionEntries(listed.rows, this.sessionId, (id) => {
+      const file = files.get(id);
+      return file ? flowReadDocument(file).document : null;
+    });
+    return { entries, refused: listed.refused, error: null };
+  }
+
+  async openSessionMenu() {
+    const result = await this.loadSessionEntries();
+    if (result.error) {
+      new import_obsidian.Notice(result.error);
+      return;
+    }
+    const menu = new import_obsidian.Menu();
+    if (!result.entries.length) {
+      menu.addItem((item) => item.setTitle("No sessions found").setDisabled(true));
+    }
+    for (const entry of result.entries) {
+      menu.addItem((item) =>
+        item.setTitle(flowSessionLabel(entry)).setChecked(entry.active).onClick(() => this.switchToSession(entry))
+      );
+      for (const child of entry.children) {
+        menu.addItem((item) =>
+          item.setTitle("  ".repeat(child.depth) + "└ " + child.name).setDisabled(true)
+        );
+      }
+    }
+    const rect = this.switchButtonEl
+      ? this.switchButtonEl.getBoundingClientRect()
+      : this.headerEl.getBoundingClientRect();
+    menu.showAtPosition({ x: rect.left, y: rect.bottom });
+  }
+
+  async cycleSession(step) {
+    const result = await this.loadSessionEntries();
+    if (result.error) {
+      new import_obsidian.Notice(result.error);
+      return;
+    }
+    const target = flowCycleTarget(result.entries, this.sessionId, step);
+    if (!target) {
+      new import_obsidian.Notice("No sessions to switch to.");
+      return;
+    }
+    this.switchToSession(target);
+  }
+
+  switchToSession(entry) {
+    const plan = flowAttachPlan({ session_id: entry.sessionId, cwd: entry.cwd });
+    if (plan.problem) {
+      new import_obsidian.Notice(plan.problem);
+      return;
+    }
+    if (entry.sessionId === this.sessionId) return;
+    const attach = () => {
+      this.term?.reset();
+      this.startShell(null, false, false, { sessionId: plan.sessionId, cwd: plan.cwd });
+      this.renderSessionHeader();
+    };
+    if (!this.proc || this.proc.killed) {
+      attach();
+      return;
+    }
+    // Switching ends the process in this tab. The conversation is not lost, it
+    // is in the list, but a run in flight would be cut off, so ask first.
+    const modal = new import_obsidian.Modal(this.app);
+    modal.contentEl.createEl("h2", { text: "Switch session" });
+    modal.contentEl.createDiv({
+      text: "This ends the process running in this tab and attaches “" +
+        (entry.title || entry.sessionId.slice(0, 8)) + "” instead. The current session stays in the list."
+    });
+    const footer = modal.contentEl.createDiv({ cls: "flow-launch-confirm-footer" });
+    footer.createEl("button", { text: "Cancel" }).addEventListener("click", () => modal.close());
+    footer.createEl("button", { cls: "mod-cta", text: "Switch" }).addEventListener("click", () => {
+      modal.close();
+      attach();
+    });
+    modal.open();
   }
 
   getThemeColors() {
@@ -8122,7 +8238,25 @@ var TerminalView = class extends import_obsidian.ItemView {
       }
     }
   }
-  startShell(workingDir = null, yoloMode = false, continueSession = false) {
+  // `attach` is {sessionId, cwd} from a session picked in the header: the
+  // terminal runs `proj-cli resume <id>` instead of a claude command of its
+  // own. proj-cli runs the guarded launcher from the session's own directory,
+  // so this method builds no claude argv for it and picks no working directory.
+  startShell(workingDir = null, yoloMode = false, continueSession = false, attach = null) {
+    const attachPlan = attach ? flowAttachPlan({ session_id: attach.sessionId, cwd: attach.cwd }) : null;
+    if (attachPlan && attachPlan.problem) {
+      // Refused before the running shell is touched, so a bad pick costs nothing.
+      this.term?.writeln("");
+      this.term?.writeln(attachPlan.problem);
+      this.term?.writeln("");
+      return;
+    }
+    if (attachPlan && this.getBackendKey() !== "claude") {
+      this.term?.writeln("");
+      this.term?.writeln("Session cycling attaches Claude Code sessions; this tab runs another provider.");
+      this.term?.writeln("");
+      return;
+    }
     this.stopShell();
     const defaultDir = this.plugin.pluginData.defaultWorkingDir;
     const vaultPath = this.plugin.getVaultPath();
@@ -8140,9 +8274,12 @@ var TerminalView = class extends import_obsidian.ItemView {
       this.term?.writeln("");
       return;
     }
-    // Persist last working directory for resume
-    this.plugin.pluginData.lastCwd = cwd;
-    this.plugin.saveData(this.plugin.pluginData);
+    // Persist last working directory for resume. An attach does not: the
+    // directory it runs in belongs to the picked session, not to this tab.
+    if (!attachPlan) {
+      this.plugin.pluginData.lastCwd = cwd;
+      this.plugin.saveData(this.plugin.pluginData);
+    }
     const cols = this.term?.cols || 80;
     const rows = this.term?.rows || 24;
     const isWindows = process.platform === "win32";
@@ -8211,9 +8348,16 @@ var TerminalView = class extends import_obsidian.ItemView {
     // started a shell. That is exactly the workspace-restore case, and it holds
     // whether the restore happens at launch or when a collapsed sidebar is
     // reopened later; every start after the first claims a new id.
-    const resumeOwn = !!(claudeIds && this.sessionId && !this._shellStarted);
+    const resumeOwn = !attachPlan && !!(claudeIds && this.sessionId && !this._shellStarted);
     this._shellStarted = true;
-    if (resumeOwn) {
+    if (attachPlan) {
+      // The picked id is the tab's id from here on, and its directory is the
+      // tab's directory, so a workspace restore resumes the same conversation
+      // from where it lives (both pass the boundary check above on restore).
+      this.sessionId = attachPlan.sessionId;
+      this.workingDir = attachPlan.cwd;
+      this.app.workspace.requestSaveLayout?.();
+    } else if (resumeOwn) {
       cliCmd += " --resume " + this.sessionId;
     } else if (claudeIds && !continueSession) {
       this.sessionId = newSessionId();
@@ -8239,11 +8383,11 @@ var TerminalView = class extends import_obsidian.ItemView {
       attempts.push(baseCmd + " " + backend.resumeFlag);
     }
     if (!attempts.includes(baseCmd)) attempts.push(baseCmd);
-    const cliChain = attempts.join(" || ");
+    const cliChain = attachPlan ? attachPlan.command : attempts.join(" || ");
     // The id this run will write under is settled above, so point the header
     // at it. A --continue start is the one case with nothing to point at: the
     // CLI picks the conversation itself and never tells the plugin which.
-    this.bindSessionHeader(cwd);
+    this.bindSessionHeader(attachPlan ? attachPlan.cwd : cwd);
 
     // Get PATH from user's login shell (GUI apps don't inherit shell config)
     let shellEnv = { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" };
@@ -8287,11 +8431,13 @@ var TerminalView = class extends import_obsidian.ItemView {
 
     // WSL's PATH is inside the distro. A Windows filesystem probe would skip
     // launch for a CLI that is installed in Linux.
-    const cliFound = shellKind === "wsl" || !!findCliBinary(backend.binary, shellEnv.PATH, pathHints);
+    const cliBinary = attachPlan ? FLOW_PROJ_CLI_COMMAND : backend.binary;
+    const cliLabel = attachPlan ? FLOW_PROJ_CLI_COMMAND : backend.label;
+    const cliFound = shellKind === "wsl" || !!findCliBinary(cliBinary, shellEnv.PATH, pathHints);
     if (!cliFound) {
       this.term?.writeln("");
-      this.term?.writeln(`${backend.label} isn't installed or isn't on PATH.`);
-      this.term?.writeln(`Install ${backend.label}, then fully quit and reopen Obsidian.`);
+      this.term?.writeln(`${cliLabel} isn't installed or isn't on PATH.`);
+      this.term?.writeln(`Install ${cliLabel}, then fully quit and reopen Obsidian.`);
       this.term?.writeln("");
     }
     const shellCmd = !cliFound
@@ -8909,6 +9055,21 @@ var VaultTerminalPlugin = class extends import_obsidian.Plugin {
         this.createNewTab(dir);
       }
     });
+    for (const [id, name, step] of [
+      ["flow-next-session", "Next session in this terminal", 1],
+      ["flow-previous-session", "Previous session in this terminal", -1]
+    ]) {
+      this.addCommand({
+        id,
+        name,
+        checkCallback: (checking) => {
+          const view = this.app.workspace.getActiveViewOfType(TerminalView);
+          if (!view || !view.sessionCyclingAvailable()) return false;
+          if (!checking) view.cycleSession(step);
+          return true;
+        }
+      });
+    }
     this.addCommand({
       id: "flow-resume",
       name: "Resume last conversation",
@@ -10497,6 +10658,201 @@ function flowRunAction(opts, deps) {
       }
       return { ok: true, stage: "launch", argv: launchArgv, cwd, results: parsed };
     });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Session cycling in the docked view (openspec launch-runs-from-graph, P3).
+//
+// The list comes from `proj-cli list --json` and the attach is `proj-cli
+// resume <id>` typed into the terminal this view already hosts. This plugin
+// reads no transcript to do either, builds no `claude` argv and never names
+// `claude.exe`: proj-cli owns the store, the work-boundary registry and the
+// guarded launcher, and a second copy of any of that here is the drift the
+// 2026-09-11 decision exists to prevent. What is decided in this file is only
+// what a picker must decide -- which rows to draw, which one is active, what
+// is refused -- and each of those is a pure function so a test can drive it
+// with a fake spawner and no Claude Code process.
+var FLOW_PROJ_CLI_REPO_ENV_VAR = "PROJ_CLI_REPO_PATH";
+var FLOW_PROJ_CLI_COMMAND = "proj-cli";
+var FLOW_SESSION_LIST_LIMIT = 25;
+var FLOW_SESSION_LIST_TIMEOUT_MS = 15000;
+// A transcript touched inside this window is drawn as live. It is a display
+// hint from the mtime proj-cli already reports, not a claim about a process.
+var FLOW_LIVE_WINDOW_SECONDS = 120;
+var FLOW_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function flowDefaultProjCliRepoPath() {
+  return process.platform === "win32" ? "C:\\Repos\\proj-cli" : null;
+}
+
+function flowProjCliRepoLooksReal(repoPath, existsFn) {
+  if (!repoPath) return false;
+  const sep = repoPath.indexOf("\\") !== -1 && repoPath.indexOf("/") === -1 ? "\\" : "/";
+  const marker = repoPath.replace(/[\\/]+$/, "") + sep + "proj_cli" + sep + "__main__.py";
+  return !!existsFn(marker);
+}
+
+function flowResolveProjCliRepoPath(env, existsFn) {
+  const fromEnv = ((env && env[FLOW_PROJ_CLI_REPO_ENV_VAR]) || "").trim();
+  const candidate = fromEnv || flowDefaultProjCliRepoPath();
+  if (!candidate) return null;
+  return flowProjCliRepoLooksReal(candidate, existsFn) ? candidate : null;
+}
+
+// Run as `python -m proj_cli` from its checkout, not as proj-cli.cmd: Node
+// refuses to spawn a .cmd without a shell (see flowResolvePythonCmd), and this
+// listing never shells.
+function flowSessionListArgv(limit) {
+  return ["-m", "proj_cli", "list", "--json", "--limit", String(limit || FLOW_SESSION_LIST_LIMIT)];
+}
+
+// Why a row cannot be resumed, or null. proj-cli already drops work sessions;
+// this is the second, independent refusal on the same terms startShell applies
+// to every terminal start, so a bug or a stale proj-cli on either side still
+// fails closed. A row with no recorded directory is refused too: there is
+// nothing to check the boundary against.
+function flowSessionResumeProblem(row) {
+  if (!row || typeof row.session_id !== "string" || !FLOW_SESSION_ID_RE.test(row.session_id)) {
+    return "That entry has no valid session id, so nothing was resumed.";
+  }
+  if (typeof row.cwd !== "string" || !row.cwd) {
+    return "That session recorded no working directory, so it cannot be resumed from here.";
+  }
+  return flowWorkVaultProblem(row.cwd) || null;
+}
+
+// stdout of `proj-cli list --json` -> the rows worth drawing. Nothing is
+// guessed: output that is not a JSON array is an error, and a refused row is
+// counted rather than drawn.
+function flowParseSessionList(stdout) {
+  let data;
+  try {
+    data = JSON.parse(String(stdout || ""));
+  } catch (err) {
+    return { rows: [], refused: 0, error: "proj-cli list did not print JSON." };
+  }
+  if (!Array.isArray(data)) {
+    return { rows: [], refused: 0, error: "proj-cli list did not print a list." };
+  }
+  const rows = [];
+  let refused = 0;
+  for (const row of data) {
+    if (flowSessionResumeProblem(row)) {
+      refused += 1;
+      continue;
+    }
+    rows.push(row);
+  }
+  return { rows, refused, error: null };
+}
+
+// The one string typed into the terminal. The id is checked against the uuid
+// shape first, so nothing a document or a list carried can reach a shell.
+function flowResumeShellCommand(sessionId) {
+  if (typeof sessionId !== "string" || !FLOW_SESSION_ID_RE.test(sessionId)) return null;
+  return FLOW_PROJ_CLI_COMMAND + " resume " + sessionId;
+}
+
+// Everything startShell needs to attach, or the reason it must not. Pure.
+function flowAttachPlan(row) {
+  const problem = flowSessionResumeProblem(row);
+  if (problem) return { problem };
+  return { problem: null, sessionId: row.session_id, cwd: row.cwd, command: flowResumeShellCommand(row.session_id) };
+}
+
+// Subagents of a session, from the run graph flow already wrote: the dispatch
+// nodes, nested by the parent each one records. Display only -- a subagent's
+// transcript is not a session anyone can resume, so these are never targets.
+function flowSubagentChildren(document) {
+  if (!document || !Array.isArray(document.nodes)) return [];
+  const session = flowSessionNode(document);
+  if (!session) return [];
+  const children = flowChildren(document);
+  const out = [];
+  const seen = new Set();
+  const walk = (parentId, depth) => {
+    for (const node of children.get(parentId) || []) {
+      const id = node["graph.node.id"];
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (node.kind !== "dispatch") continue;
+      out.push({
+        id,
+        name: node["graph.node.name"] || node.agent_type || "subagent",
+        agentType: node.agent_type || null,
+        depth
+      });
+      walk(id, depth + 1);
+    }
+  };
+  walk(session["graph.node.id"], 1);
+  return out;
+}
+
+// Rows + the run graphs on disk -> the entries the dropdown draws. `readGraph`
+// maps a session id to its parsed document or null; a document that fails the
+// same validation the graph pane applies is not used, so a refused graph
+// contributes no children.
+function flowSessionEntries(rows, activeId, readGraph) {
+  return rows.map((row) => {
+    let children = [];
+    const doc = readGraph ? readGraph(row.session_id) : null;
+    if (doc && !flowValidateDocument(doc).problem) children = flowSubagentChildren(doc);
+    return {
+      sessionId: row.session_id,
+      title: row.title || null,
+      project: row.project || null,
+      cwd: row.cwd,
+      slug: row.slug || null,
+      ageSeconds: typeof row.age_seconds === "number" ? row.age_seconds : null,
+      live: typeof row.age_seconds === "number" && row.age_seconds < FLOW_LIVE_WINDOW_SECONDS,
+      active: row.session_id === activeId,
+      children
+    };
+  });
+}
+
+// Keyboard cycle. When the active session is not in the list (a fresh tab, or
+// one older than the window) forward lands on the first entry and backward on
+// the last, rather than doing nothing.
+function flowCycleTarget(entries, activeId, step) {
+  if (!entries || !entries.length) return null;
+  const at = entries.findIndex((e) => e.sessionId === activeId);
+  if (at === -1) return step < 0 ? entries[entries.length - 1] : entries[0];
+  return entries[(at + (step < 0 ? -1 : 1) + entries.length) % entries.length];
+}
+
+function flowSessionAge(seconds) {
+  if (typeof seconds !== "number") return "";
+  if (seconds < 60) return Math.round(seconds) + "s";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m";
+  if (seconds < 86400) return (seconds / 3600).toFixed(1) + "h";
+  return (seconds / 86400).toFixed(1) + "d";
+}
+
+function flowSessionLabel(entry) {
+  const parts = [(entry.live ? "\u25cf " : "") + (entry.title || "(unnamed)")];
+  const meta = [entry.project, flowSessionAge(entry.ageSeconds)].filter(Boolean).join(" \u00b7 ");
+  if (meta) parts.push(meta);
+  return parts.join("  \u2014  ") + (entry.active ? "  (active)" : "");
+}
+
+// Spawns proj-cli and parses. `deps.spawn` is the same injection point
+// flowRunAction uses; the real one is flowSpawnChild.
+function flowListSessions(opts, deps) {
+  const spawn = (deps && deps.spawn) || flowSpawnChild;
+  if (!opts || !opts.projCliRepoPath) {
+    return Promise.resolve({ rows: [], refused: 0, error: "proj-cli was not found." });
+  }
+  return spawn(opts.pythonCmd, flowSessionListArgv(opts.limit), {
+    cwd: opts.projCliRepoPath,
+    timeoutMs: opts.timeoutMs || FLOW_SESSION_LIST_TIMEOUT_MS
+  }).then((result) => {
+    if (result.code !== 0) {
+      return { rows: [], refused: 0, error: "proj-cli list failed: " + flowClip(result.stderr || ("exit " + result.code), 160) };
+    }
+    return flowParseSessionList(result.stdout);
   });
 }
 

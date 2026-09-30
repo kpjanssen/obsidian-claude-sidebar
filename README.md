@@ -165,6 +165,12 @@ absolute path, which would be wrong on the other machine. There is no setting
 to turn either off; that is the point of a boundary rather than a preference.
 Tests: `node test/flow-launch.test.js` and `node test/flow-face.test.js`.
 
+## Session cycling (fork)
+
+A **Sessions** button in the session header lists live and recent Claude Code sessions, marks the active one, and draws each session's subagents beneath it (from the run graph `flow` already wrote; they are display only). Picking one runs `proj-cli resume <id>` in this tab's terminal. Two commands, "Next session in this terminal" and "Previous session in this terminal", cycle the same list from the keyboard; bind them in Settings > Hotkeys.
+
+The list is `python -m proj_cli list --json`, run from the proj-cli checkout (found at `C:\Repos\proj-cli`, or at `PROJ_CLI_REPO_PATH`). The plugin reads no transcript, builds no `claude` argv and never names `claude.exe`; `proj-cli` must also be on `PATH` for the terminal to run `proj-cli resume`. With no proj-cli checkout found the button and commands are absent. Sessions in a professional vault are refused in the list and again on resume, and switching asks first when a process is running in the tab. Tests: `node test/flow-session-cycling.test.js`.
+
 ## Platform Support
 
 | Platform | Status |

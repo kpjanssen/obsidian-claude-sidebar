@@ -56,6 +56,21 @@
 }
 
 /* Untitled is a state, not a name, and is drawn as one. */
+/* The session picker sits with the header it changes, and is quiet until used. */
+.flow-session-switch {
+	margin-top: 4px;
+	padding: 0 6px;
+	height: auto;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	background: transparent;
+	box-shadow: none;
+}
+
+.flow-session-switch:hover {
+	color: var(--text-normal);
+}
+
 .flow-session-title.is-untitled {
 	font-weight: var(--font-normal);
 	font-style: italic;
